@@ -1,34 +1,23 @@
 #!/bin/bash
+
 datasets=(
-    # 'pathmnist'
-    # 'octmnist'
-    # 'pneumoniamnist'
-    # 'breastmnist'
-    # 'dermamnist'
-    # 'bloodmnist'
-	# 'retinamnist'
-	# 'tissuemnist'
-    # 'dermamnist'
-	# 'tissuemnist'
     'pathmnist'
     'bloodmnist'
 )
 
-for dataset in ${datasets[@]}
-do
-	for g in 1 2 3 4
-	do
-	python generate_data.py 		\
-			--model=resnet18 	 \
-			--dataset=${dataset} \
-			--image_size=224 \
-			--batch_size=256 		\
-			--test_batch_size=512 \
-			--group=$g \
-			--beta=0.1 \
-			--gamma=0.5 \
-			--save_path_head=../data/${dataset} \
-			# --init_data_path=/home/dataset/imagenet/train
-
-	done
+for dataset in "${datasets[@]}"; do
+    python generate_data.py \
+        --model=resnet18 \
+        --dataset=${dataset} \
+        --teacher_checkpoint=/path/to/${dataset}/resnet18_teacher.pth \
+        --dataset_path=/path/to/imagenet \
+        --output_dir=../data/${dataset} \
+        --file_prefix=resnet18_${dataset}_unified_curated \
+        --subset_size=500000 \
+        --batch_size=128 \
+        --num_augmentations=5 \
+        --w_sens=0.5 \
+        --w_pot=0.5 \
+        --samples_per_class=50 \
+        --num_groups=4
 done
