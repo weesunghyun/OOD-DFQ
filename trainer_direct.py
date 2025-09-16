@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import utils as utils
 import numpy as np
 import torch
+from collections import OrderedDict
 from pytorchcv.models.resnet import ResUnit
 # from pytorchcv.models.mobilenet import DwsConvBlock  # 이 import는 사용하지 않음
 from pytorchcv.models.mobilenetv2 import LinearBottleneck
@@ -99,6 +100,25 @@ class Trainer(object):
 		self.activation = []
 		self.handle_list = []
 
+		self.bsdc_start_epoch = int(getattr(self.settings, 'bsdc_start_epoch', self.settings.nEpochs - 1))
+		if self.bsdc_start_epoch < 0:
+			self.bsdc_start_epoch = 0
+		self.bsdc_num_batches = getattr(self.settings, 'bsdc_num_batches', None)
+		if self.bsdc_num_batches is not None:
+			self.bsdc_num_batches = int(self.bsdc_num_batches)
+		if self.bsdc_num_batches is not None and self.bsdc_num_batches <= 0:
+			self.bsdc_num_batches = None
+		self.bsdc_correction_applied = False
+		self.bn_layer_names = []
+		self.teacher_bn_layers = []
+		self.student_bn_layers = []
+		self.teacher_bn_source_stats = []
+		self.bsdc_delta_means = []
+		self.bsdc_delta_vars = []
+		self.bsdc_teacher_ood_stats = []
+		self.bsdc_student_ood_stats = []
+		self._init_bn_tracking()
+
 	def update_lr(self, epoch):
 		"""
 		update learning rate of optimizers
@@ -112,6 +132,179 @@ class Trainer(object):
 		for param_group in self.optimizer_G.param_groups:
 			param_group['lr'] = lr_G
 
+	def _init_bn_tracking(self):
+		"""Prepare BatchNorm bookkeeping for BSDC."""
+		if not hasattr(self.model_teacher, 'module') or not hasattr(self.model, 'module'):
+			return
+
+		teacher_bn_dict = OrderedDict(
+			(name, module)
+			for name, module in self.model_teacher.module.named_modules()
+			if isinstance(module, nn.modules.batchnorm._BatchNorm)
+		)
+		student_bn_dict = OrderedDict(
+			(name, module)
+			for name, module in self.model.module.named_modules()
+			if isinstance(module, nn.modules.batchnorm._BatchNorm)
+		)
+
+		common_names = [name for name in teacher_bn_dict.keys() if name in student_bn_dict]
+		for name in common_names:
+			teacher_bn = teacher_bn_dict[name]
+			student_bn = student_bn_dict[name]
+			self.bn_layer_names.append(name)
+			self.teacher_bn_layers.append(teacher_bn)
+			self.student_bn_layers.append(student_bn)
+			self.teacher_bn_source_stats.append({
+				'mean': teacher_bn.running_mean.detach().clone(),
+				'var': teacher_bn.running_var.detach().clone()
+			})
+
+		if self.logger is not None and len(self.teacher_bn_layers) == 0:
+			self.logger.warning('BSDC: No matching BatchNorm layers were found; BSDC will be skipped.')
+		elif self.logger is not None and len(self.teacher_bn_layers) != len(self.student_bn_layers):
+			self.logger.warning(
+				'BSDC: Mismatched number of BatchNorm layers between teacher (%d) and student (%d).',
+				len(self.teacher_bn_layers), len(self.student_bn_layers)
+			)
+
+		self.bsdc_delta_means = [torch.zeros_like(stats['mean']) for stats in self.teacher_bn_source_stats]
+		self.bsdc_delta_vars = [torch.zeros_like(stats['var']) for stats in self.teacher_bn_source_stats]
+		self.bsdc_teacher_ood_stats = [None for _ in self.teacher_bn_layers]
+		self.bsdc_student_ood_stats = [None for _ in self.student_bn_layers]
+
+	def _create_bn_stat_hook(self, mean_store, var_store, count_store, index):
+		def hook(module, inputs, outputs):
+			if not inputs:
+				return
+			input_tensor = inputs[0]
+			if input_tensor.dim() <= 1:
+				return
+			dims = [0]
+			if input_tensor.dim() > 2:
+				dims.extend(range(2, input_tensor.dim()))
+			mean = input_tensor.mean(dim=dims)
+			var = input_tensor.var(dim=dims, unbiased=False)
+			if dist.is_available() and dist.is_initialized():
+				mean_clone = mean.clone()
+				var_clone = var.clone()
+				dist.all_reduce(mean_clone, op=dist.ReduceOp.SUM)
+				dist.all_reduce(var_clone, op=dist.ReduceOp.SUM)
+				world_size = dist.get_world_size()
+				mean = mean_clone / world_size
+				var = var_clone / world_size
+			mean_store[index] += mean.detach()
+			var_store[index] += var.detach()
+			count_store[index] += 1
+		return hook
+
+	def apply_bsdc_correction(self, data_loader, epoch):
+		"""Apply BN Stat Delta Correction using the provided OOD data loader."""
+		if self.bsdc_correction_applied:
+			return
+		if len(self.teacher_bn_layers) == 0 or len(self.student_bn_layers) == 0:
+			self.bsdc_correction_applied = True
+			return
+		if data_loader is None:
+			if self.logger is not None:
+				self.logger.warning('BSDC: OOD dataloader is None. Skipping BN correction.')
+			self.bsdc_correction_applied = True
+			return
+
+		teacher_means_accum = [torch.zeros_like(mod.running_mean) for mod in self.teacher_bn_layers]
+		teacher_vars_accum = [torch.zeros_like(mod.running_var) for mod in self.teacher_bn_layers]
+		student_means_accum = [torch.zeros_like(mod.running_mean) for mod in self.student_bn_layers]
+		student_vars_accum = [torch.zeros_like(mod.running_var) for mod in self.student_bn_layers]
+		teacher_counts = [0 for _ in self.teacher_bn_layers]
+		student_counts = [0 for _ in self.student_bn_layers]
+
+		handles = []
+		teacher_prev_mode = self.model_teacher.training
+		student_prev_mode = self.model.training
+
+		self.model_teacher.train()
+		self.model.train()
+
+		if hasattr(data_loader, 'sampler') and hasattr(data_loader.sampler, 'set_epoch'):
+			data_loader.sampler.set_epoch(epoch + self.settings.nEpochs)
+
+		try:
+			for idx, module in enumerate(self.teacher_bn_layers):
+				handles.append(module.register_forward_hook(
+					self._create_bn_stat_hook(teacher_means_accum, teacher_vars_accum, teacher_counts, idx)))
+			for idx, module in enumerate(self.student_bn_layers):
+				handles.append(module.register_forward_hook(
+					self._create_bn_stat_hook(student_means_accum, student_vars_accum, student_counts, idx)))
+
+			batch_limit = self.bsdc_num_batches
+			with torch.no_grad():
+				for batch_idx, (images, _) in enumerate(data_loader):
+					images = images.to(self.args.local_rank)
+					_ = self.model_teacher(images)
+					_ = self.model(images)
+					if batch_limit is not None and (batch_idx + 1) >= batch_limit:
+						break
+		finally:
+			for handle in handles:
+				handle.remove()
+			if not teacher_prev_mode:
+				self.model_teacher.eval()
+			if not student_prev_mode:
+				self.model.eval()
+
+		teacher_ood_means = []
+		teacher_ood_vars = []
+		for idx, count in enumerate(teacher_counts):
+			if count > 0:
+				teacher_ood_means.append(teacher_means_accum[idx] / count)
+				teacher_ood_vars.append(teacher_vars_accum[idx] / count)
+			else:
+				teacher_ood_means.append(self.teacher_bn_layers[idx].running_mean.detach().clone())
+				teacher_ood_vars.append(self.teacher_bn_layers[idx].running_var.detach().clone())
+
+		student_ood_means = []
+		student_ood_vars = []
+		for idx, count in enumerate(student_counts):
+			if count > 0:
+				student_ood_means.append(student_means_accum[idx] / count)
+				student_ood_vars.append(student_vars_accum[idx] / count)
+			else:
+				student_ood_means.append(self.student_bn_layers[idx].running_mean.detach().clone())
+				student_ood_vars.append(self.student_bn_layers[idx].running_var.detach().clone())
+
+		for idx in range(len(self.student_bn_layers)):
+			delta_mean = teacher_ood_means[idx] - student_ood_means[idx]
+			delta_var = teacher_ood_vars[idx] - student_ood_vars[idx]
+			self.bsdc_delta_means[idx] = delta_mean.detach()
+			self.bsdc_delta_vars[idx] = delta_var.detach()
+			self.bsdc_teacher_ood_stats[idx] = {
+				'mean': teacher_ood_means[idx].detach(),
+				'var': teacher_ood_vars[idx].detach()
+			}
+			self.bsdc_student_ood_stats[idx] = {
+				'mean': student_ood_means[idx].detach(),
+				'var': student_ood_vars[idx].detach()
+			}
+
+			corrected_mean = self.teacher_bn_source_stats[idx]['mean'] + delta_mean
+			corrected_var = self.teacher_bn_source_stats[idx]['var'] + delta_var
+			corrected_var = torch.clamp(corrected_var, min=1e-6)
+			self.student_bn_layers[idx].running_mean.data.copy_(corrected_mean)
+			self.student_bn_layers[idx].running_var.data.copy_(corrected_var)
+
+		for module, src_stats in zip(self.teacher_bn_layers, self.teacher_bn_source_stats):
+			module.running_mean.data.copy_(src_stats['mean'])
+			module.running_var.data.copy_(src_stats['var'])
+
+		if self.logger is not None:
+			processed_batches = max(teacher_counts) if len(teacher_counts) > 0 else 0
+			self.logger.info(
+				'BSDC: Applied BN statistic delta correction using %d batches across %d layers.',
+				processed_batches,
+				len(self.student_bn_layers)
+			)
+
+		self.bsdc_correction_applied = True
 	def loss_fn_kd(self, output, labels, teacher_outputs):
 		"""
 		Compute the knowledge-distillation (KD) loss given outputs, labels.
@@ -357,6 +550,9 @@ class Trainer(object):
 		# 	for tag, value in list(self.scalar_info.items()):
 		# 		self.tensorboard_logger.scalar_summary(tag, value, self.run_count)
 		# 	self.scalar_info = {}
+
+		if (not self.bsdc_correction_applied) and (epoch >= self.bsdc_start_epoch):
+			self.apply_bsdc_correction(direct_dataload, epoch)
 
 		return top1_error.avg, top1_loss.avg, top5_error.avg
 
