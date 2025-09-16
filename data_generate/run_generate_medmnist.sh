@@ -1,6 +1,10 @@
 #!/bin/bash
 
+medmnist_path="path-to-medmnist"
+imagenet_path="path-to-imagenet"
 datasets=(
+    'dermamnist'
+    'tissuemnist'
     'pathmnist'
     'bloodmnist'
 )
@@ -9,8 +13,8 @@ for dataset in "${datasets[@]}"; do
     python generate_data.py \
         --model=resnet18 \
         --dataset=${dataset} \
-        --teacher_checkpoint=/path/to/${dataset}/resnet18_teacher.pth \
-        --dataset_path=/path/to/imagenet \
+        --teacher_checkpoint=${medmnist_path}/${dataset}/resnet18_224_1.pth \
+        --dataset_path=${imagenet_path} \
         --output_dir=../data/${dataset} \
         --file_prefix=resnet18_${dataset}_unified_curated \
         --subset_size=500000 \
