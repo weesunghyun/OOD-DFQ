@@ -9,17 +9,19 @@ Pytorch == 1.8.1
 
 ## Reproduce results
 
-### Stage1: Generate data.
+### Stage1: Curate OOD data.
 
-take cifar10 as an example:
 ```
 cd data_generate
 ```
-"--save_path_head" in **run_generate_cifar10.sh/run_generate_imagenet.sh** is the path where you want to save your generated data pickle.
+
+Each helper script (for example `run_generate_imagenet.sh`) now invokes the unified informativeness-based curation pipeline. Update the dataset path, optional teacher checkpoint, and output directory before running:
 
 ```
-bash run_generate_cifar10.sh
+bash run_generate_imagenet.sh
 ```
+
+The command computes augmentation sensitivity and augmentation potential for a large ImageNet subset, ranks images by the unified score, and writes curated pickle shards together with metadata.
 
 
 ### Stage2: Train the quantized network

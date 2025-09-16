@@ -1,11 +1,12 @@
-for g in 1 2 3 4
-do
-python generate_data.py 		\
-		--model=resnet18 	 \
-		--batch_size=256 		\
-		--test_batch_size=512 \
-		--group=$g \
-		--beta=0.1 \
-		--gamma=0.5 \
-		--save_path_head=../data/imagenet
-done
+python generate_data.py \
+    --model=resnet18 \
+    --dataset_path=/path/to/imagenet \
+    --output_dir=../data/imagenet \
+    --file_prefix=imagenet_unified_curated \
+    --subset_size=500000 \
+    --batch_size=128 \
+    --num_augmentations=5 \
+    --w_sens=0.5 \
+    --w_pot=0.5 \
+    --samples_per_class=50 \
+    --num_groups=4

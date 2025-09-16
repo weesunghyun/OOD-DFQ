@@ -1,11 +1,13 @@
-for g in 1 2 3 4
-do
-python generate_data.py 		\
-		--model=resnet20_cifar10 			\
-		--batch_size=256 		\
-		--test_batch_size=512 \
-		--group=$g \
-		--beta=10 \
-		--gamma=2 \
-		--save_path_head=../data/cifar10
-done
+python generate_data.py \
+    --model=resnet20_cifar10 \
+    --teacher_checkpoint=/path/to/resnet20_cifar10_teacher.pth \
+    --dataset_path=/path/to/imagenet \
+    --output_dir=../data/cifar10 \
+    --file_prefix=resnet20_cifar10_unified_curated \
+    --subset_size=500000 \
+    --batch_size=128 \
+    --num_augmentations=5 \
+    --w_sens=0.5 \
+    --w_pot=0.5 \
+    --samples_per_class=50 \
+    --num_groups=4
