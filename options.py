@@ -64,7 +64,13 @@ class Option(NetOption):
 		self.lam = 1000
 		self.eps = 0.01
 
-		
+		# ----------- BSDC options --------------------------------------
+		self.bsdc_start_epoch = self.conf.get('bsdc_start_epoch', self.nEpochs - 1)
+		self.bsdc_num_batches = self.conf.get('bsdc_num_batches', None)
+		if self.bsdc_num_batches is not None:
+			self.bsdc_num_batches = int(self.bsdc_num_batches)
+
+
 	def set_save_path(self):
 		path='HAST_log'
 		if not os.path.isdir(path):
