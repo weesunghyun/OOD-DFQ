@@ -5,12 +5,13 @@ import os
 import pickle
 import random
 from collections import defaultdict
-from typing import Callable, Dict, List, Optional
+from heapq import heappush, heappushpop, nlargest
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 from torchvision.datasets.folder import default_loader
 from tqdm import tqdm
@@ -36,6 +37,21 @@ CLASSIFICATION_DATASETS = {
     'organcmnist': 11,
     'organsmnist': 11,
 }
+
+
+def compute_even_class_targets(total: int, num_classes: int) -> Dict[int, int]:
+    if num_classes <= 0:
+        raise ValueError('Number of classes must be positive to distribute targets evenly.')
+
+    base = total // num_classes
+    remainder = total % num_classes
+
+    targets = {label: base for label in range(num_classes)}
+
+    for label in range(remainder):
+        targets[label] += 1
+
+    return targets
 
 
 def arg_parse():
@@ -70,8 +86,8 @@ def arg_parse():
                         help='Base filename prefix for curated data shards (without group suffix).')
     parser.add_argument('--subset_size',
                         type=int,
-                        default=500000,
-                        help='Number of images sampled for scoring. Use -1 to process the full dataset.')
+                        default=-1,
+                        help='Number of images sampled for initial pseudo-labeling. Use -1 to process the full dataset.')
     parser.add_argument('--batch_size',
                         type=int,
                         default=1024,
@@ -96,6 +112,14 @@ def arg_parse():
                         type=int,
                         default=50,
                         help='Number of curated samples to keep per teacher pseudo-label.')
+    parser.add_argument('--candidate_pool_per_class',
+                        type=int,
+                        default=100,
+                        help='Number of pseudo-labeled candidates to retain per class before augmentation scoring.')
+    parser.add_argument('--total_candidate_pool',
+                        type=int,
+                        default=None,
+                        help='Total number of pseudo-labeled candidates to retain across all classes before augmentation scoring.')
     parser.add_argument('--max_total_samples',
                         type=int,
                         default=None,
@@ -112,6 +136,10 @@ def arg_parse():
                         type=str,
                         default=None,
                         help='Optional output path for metadata JSON describing curated samples.')
+    parser.add_argument('--total_samples',
+                        type=int,
+                        default=None,
+                        help='Total number of curated samples to keep across all classes after augmentation scoring.')
     parser.add_argument('--seed',
                         type=int,
                         default=42,
@@ -157,6 +185,24 @@ class ImageFolderWithPaths(datasets.ImageFolder):
         if self.target_transform is not None:
             target = self.target_transform(target)
         return sample, target, path
+
+
+class CandidateDataset(Dataset):
+    """Dataset wrapper around candidate samples identified by pseudo-labeling."""
+
+    def __init__(self, candidates: List[Dict[str, Any]], image_loader: Callable[[str], object]):
+        self.candidates = candidates
+        self.loader = image_loader
+
+    def __len__(self) -> int:
+        return len(self.candidates)
+
+    def __getitem__(self, index: int):
+        entry = self.candidates[index]
+        image = self.loader(entry['path'])
+        pseudo_label = entry['pseudo_label']
+        path = entry['path']
+        return image, pseudo_label, path
 
 
 def build_transforms(image_size: int) -> Dict[str, transforms.Compose]:
@@ -218,9 +264,119 @@ class UnifiedInformativenessCurator:
         self.loader = image_loader
         self.eps = 1e-8
 
-    def score_dataset(
+    def build_candidate_pool(
         self,
         dataset: datasets.ImageFolder,
+        candidate_pool_per_class: Optional[int],
+        candidate_pool_targets: Optional[Dict[int, int]],
+        batch_size: int,
+        num_workers: int,
+        subset_size: Optional[int],
+        seed: int,
+    ) -> List[Dict[str, Any]]:
+        if subset_size is not None and subset_size > 0 and subset_size < len(dataset):
+            generator = torch.Generator()
+            generator.manual_seed(seed)
+            selected_indices = torch.randperm(len(dataset), generator=generator)[:subset_size].tolist()
+            working_dataset = Subset(dataset, selected_indices)
+            print(f'Pseudo-labeling a random subset of {len(working_dataset)} / {len(dataset)} images.')
+        else:
+            working_dataset = dataset
+            print(f'Pseudo-labeling the full dataset with {len(dataset)} images.')
+
+        loader = DataLoader(
+            working_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+            collate_fn=lambda batch: batch,
+        )
+
+        total_batches = math.ceil(len(working_dataset) / batch_size)
+
+        default_candidate_limit = None
+        if candidate_pool_per_class is not None and candidate_pool_per_class > 0:
+            default_candidate_limit = candidate_pool_per_class
+
+        candidate_limits = candidate_pool_targets or {}
+
+        candidate_heaps: Dict[int, List[Tuple[float, int, Dict[str, Any]]]] = defaultdict(list)
+        candidate_lists: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        class_counts: Dict[int, int] = defaultdict(int)
+        candidate_counter = 0
+
+        with torch.inference_mode():
+            for batch in tqdm(loader, desc="Pseudo-labeling batches", total=total_batches):
+                images, _, paths = zip(*batch)
+                inputs = torch.stack([self.base_transform(img) for img in images]).to(self.device)
+
+                logits = self.teacher_model(inputs)
+                probs = F.softmax(logits, dim=1)
+                max_probs, pseudo_labels = probs.max(dim=1)
+
+                for idx in range(len(paths)):
+                    label = int(pseudo_labels[idx].item())
+                    confidence = float(max_probs[idx].item())
+
+                    class_counts[label] += 1
+                    candidate_counter += 1
+
+                    entry: Dict[str, Any] = {
+                        'path': paths[idx],
+                        'pseudo_label': label,
+                        'candidate_confidence': confidence,
+                    }
+
+                    limit = candidate_limits.get(label, default_candidate_limit)
+                    if limit is not None and limit <= 0:
+                        continue
+
+                    if limit is None:
+                        candidate_lists[label].append(entry)
+                    else:
+                        heap_entry = (confidence, candidate_counter, entry)
+                        heap = candidate_heaps[label]
+                        if len(heap) < limit:
+                            heappush(heap, heap_entry)
+                        else:
+                            heappushpop(heap, heap_entry)
+
+        candidate_pool: List[Dict[str, Any]] = []
+        total_candidates = 0
+
+        all_labels = set(class_counts.keys())
+        all_labels.update(candidate_limits.keys())
+
+        for label in sorted(all_labels):
+            limit = candidate_limits.get(label, default_candidate_limit)
+
+            if limit is None:
+                label_candidates = candidate_lists[label]
+            else:
+                heap = candidate_heaps[label]
+                top_items = nlargest(len(heap), heap)
+                label_candidates = [item[2] for item in top_items]
+
+            label_candidates.sort(key=lambda x: x['candidate_confidence'], reverse=True)
+
+            for rank, entry in enumerate(label_candidates, 1):
+                entry['candidate_rank'] = rank
+                candidate_pool.append(entry)
+
+            total_candidates += len(label_candidates)
+            print(
+                f'Pseudo-label {label}: total {class_counts.get(label, 0)} samples. '
+                f'Candidate pool size: {len(label_candidates)}'
+            )
+
+        print(f'Total candidate samples: {total_candidates}')
+
+        return candidate_pool
+
+    def score_dataset(
+        self,
+        dataset: Dataset,
         subset_size: Optional[int],
         batch_size: int,
         num_workers: int,
@@ -300,19 +456,33 @@ class UnifiedInformativenessCurator:
         scored_samples: List[Dict[str, float]],
         samples_per_class: Optional[int],
         max_total_samples: Optional[int] = None,
+        per_class_limits: Optional[Dict[int, int]] = None,
     ) -> List[Dict[str, float]]:
         grouped: Dict[int, List[Dict[str, float]]] = defaultdict(list)
         for sample in scored_samples:
             grouped[sample['pseudo_label']].append(sample)
 
         curated: List[Dict[str, float]] = []
-        for pseudo_label, items in grouped.items():
-            items.sort(key=lambda x: x['score'], reverse=True)
-            limit = len(items)
-            if samples_per_class is not None:
-                limit = min(limit, samples_per_class)
-            curated.extend(items[:limit])
-            print(f'Pseudo-label {pseudo_label}: selected {min(limit, len(items))} / {len(items)} samples.')
+        all_labels = set(grouped.keys())
+        if per_class_limits is not None:
+            all_labels.update(per_class_limits.keys())
+
+        for pseudo_label in sorted(all_labels):
+            items = grouped.get(pseudo_label, [])
+            if items:
+                items.sort(key=lambda x: x['score'], reverse=True)
+
+            available = len(items)
+            limit: Optional[int] = None
+            if per_class_limits is not None and pseudo_label in per_class_limits:
+                limit = per_class_limits[pseudo_label]
+            elif samples_per_class is not None:
+                limit = samples_per_class
+
+            take = available if limit is None else min(available, limit)
+
+            curated.extend(items[:take])
+            print(f'Pseudo-label {pseudo_label}: selected {take} / {available} samples.')
 
         if max_total_samples is not None and len(curated) > max_total_samples:
             curated.sort(key=lambda x: x['score'], reverse=True)
@@ -534,13 +704,102 @@ def main():
     )
 
     subset_size = None if args.subset_size in (-1, None) else args.subset_size
-    scored_samples = curator.score_dataset(
+
+    if args.dataset is not None and args.dataset in CLASSIFICATION_DATASETS:
+        num_teacher_classes = CLASSIFICATION_DATASETS[args.dataset]
+    else:
+        num_teacher_classes = getattr(curator.teacher_model, 'num_classes', None)
+        if num_teacher_classes is None:
+            with torch.inference_mode():
+                dummy = torch.zeros(1, 3, args.image_size, args.image_size, device=device)
+                logits = curator.teacher_model(dummy)
+                num_teacher_classes = logits.shape[1]
+
+    if num_teacher_classes is None:
+        raise ValueError('Unable to determine the number of pseudo-label classes for distribution.')
+
+    candidate_pool_per_class = args.candidate_pool_per_class
+    candidate_pool_targets = None
+    if args.total_candidate_pool is not None:
+        if args.total_candidate_pool <= 0:
+            raise ValueError('--total_candidate_pool must be positive when provided.')
+        candidate_pool_targets = compute_even_class_targets(args.total_candidate_pool, num_teacher_classes)
+        candidate_pool_per_class = None
+        print(
+            f'Distributing total candidate pool of {args.total_candidate_pool} '
+            f'across {num_teacher_classes} pseudo-labels:'
+        )
+        for label in range(num_teacher_classes):
+            print(f'  class {label}: {candidate_pool_targets.get(label, 0)}')
+
+    samples_per_class = args.samples_per_class
+    per_class_sample_limits: Optional[Dict[int, int]] = None
+    max_total_samples = args.max_total_samples
+    if args.total_samples is not None:
+        if args.total_samples <= 0:
+            raise ValueError('--total_samples must be positive when provided.')
+        per_class_sample_limits = compute_even_class_targets(args.total_samples, num_teacher_classes)
+        samples_per_class = None
+        print(
+            f'Distributing total curated sample target of {args.total_samples} '
+            f'across {num_teacher_classes} pseudo-labels:'
+        )
+        for label in range(num_teacher_classes):
+            print(f'  class {label}: {per_class_sample_limits.get(label, 0)}')
+
+        if max_total_samples is None:
+            max_total_samples = args.total_samples
+        else:
+            new_cap = min(max_total_samples, args.total_samples)
+            if new_cap < max_total_samples:
+                print(
+                    f'Warning: reducing total cap from {max_total_samples} to {new_cap} '
+                    f'to satisfy --total_samples={args.total_samples}.'
+                )
+            max_total_samples = new_cap
+
+    candidate_pool = curator.build_candidate_pool(
         dataset=dataset,
+        candidate_pool_per_class=candidate_pool_per_class,
+        candidate_pool_targets=candidate_pool_targets,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
         subset_size=subset_size,
+        seed=args.seed,
+    )
+
+    if not candidate_pool:
+        raise ValueError('Candidate pool is empty after pseudo-labeling.')
+
+    candidate_lookup = {entry['path']: entry for entry in candidate_pool}
+    candidate_dataset = CandidateDataset(candidate_pool, image_loader=dataset.loader)
+
+    scored_samples = curator.score_dataset(
+        dataset=candidate_dataset,
+        subset_size=None,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         seed=args.seed,
     )
+
+    mismatches = 0
+    for sample in scored_samples:
+        metadata = candidate_lookup.get(sample['path'])
+        if metadata is None:
+            continue
+
+        predicted_label = sample['pseudo_label']
+        sample['predicted_pseudo_label'] = predicted_label
+        sample['initial_pseudo_label'] = metadata['pseudo_label']
+        sample['candidate_confidence'] = metadata['candidate_confidence']
+        sample['candidate_rank'] = metadata['candidate_rank']
+        sample['pseudo_label'] = metadata['pseudo_label']
+
+        if predicted_label != metadata['pseudo_label']:
+            mismatches += 1
+
+    if mismatches > 0:
+        print(f'Warning: {mismatches} candidate(s) changed pseudo-label during augmentation scoring.')
 
     summary = summarize_scores(scored_samples)
     print('Scoring summary:')
@@ -549,8 +808,9 @@ def main():
 
     curated_samples = curator.select_top_samples(
         scored_samples=scored_samples,
-        samples_per_class=args.samples_per_class,
-        max_total_samples=args.max_total_samples,
+        samples_per_class=samples_per_class,
+        max_total_samples=max_total_samples,
+        per_class_limits=per_class_sample_limits,
     )
 
     print(f'Total curated samples: {len(curated_samples)}')
