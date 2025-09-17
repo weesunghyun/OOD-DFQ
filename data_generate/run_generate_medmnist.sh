@@ -17,11 +17,11 @@ for dataset in "${datasets[@]}"; do
         --dataset_path=${imagenet_path} \
         --output_dir=../data/${dataset} \
         --file_prefix=resnet18_${dataset}_unified_curated \
-        --subset_size=500000 \
         --batch_size=1024 \
         --num_augmentations=5 \
         --w_sens=0.5 \
         --w_pot=0.5 \
-        --samples_per_class=50 \
+        --total_candidate_pool=25600 \
+        --total_samples=5120 \
         --num_groups=4
 done
