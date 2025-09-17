@@ -5,8 +5,8 @@ import os
 import pickle
 import random
 from collections import defaultdict
-from heapq import heappush, heappushpop, nlargest
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from heapq import heappush, heappushpop, heapreplace, nlargest
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -205,6 +205,134 @@ class CandidateDataset(Dataset):
         return image, pseudo_label, path
 
 
+class RunningStats:
+    def __init__(self) -> None:
+        self.count = 0
+        self.total = 0.0
+        self.total_sq = 0.0
+
+    def update(self, value: float) -> None:
+        self.count += 1
+        self.total += value
+        self.total_sq += value * value
+
+    def mean(self) -> float:
+        if self.count == 0:
+            return 0.0
+        return self.total / self.count
+
+    def std(self) -> float:
+        if self.count <= 1:
+            return 0.0
+        mean = self.mean()
+        variance = max((self.total_sq / self.count) - mean * mean, 0.0)
+        return math.sqrt(variance)
+
+
+class ScoreSummaryAccumulator:
+    def __init__(self) -> None:
+        self.metrics: Dict[str, RunningStats] = {
+            'sensitivity': RunningStats(),
+            'potential': RunningStats(),
+            'score': RunningStats(),
+        }
+
+    def update(self, sample: Dict[str, float]) -> None:
+        for key, stats in self.metrics.items():
+            stats.update(float(sample[key]))
+
+    def to_dict(self) -> Dict[str, float]:
+        summary: Dict[str, float] = {}
+        for name, stats in self.metrics.items():
+            summary[f'{name}_mean'] = stats.mean()
+            summary[f'{name}_std'] = stats.std()
+        return summary
+
+    @property
+    def count(self) -> int:
+        # All metrics are updated together, so reuse the score metric's count.
+        return self.metrics['score'].count
+
+
+class PerClassSampleSelector:
+    def __init__(
+        self,
+        default_limit: Optional[int],
+        per_class_limits: Optional[Dict[int, int]] = None,
+        global_cap: Optional[int] = None,
+    ) -> None:
+        self.default_limit = default_limit
+        self.per_class_limits = per_class_limits or {}
+        self.global_cap = global_cap
+        self.heaps: Dict[int, List[Tuple[float, int, Dict[str, Any]]]] = defaultdict(list)
+        self.counter = 0
+        self._use_heap_for_unlimited = global_cap is not None
+        self._unlimited_entries: List[Tuple[float, int, Dict[str, Any]]] = []
+
+    def add(self, sample: Dict[str, Any]) -> None:
+        label = sample['pseudo_label']
+        limit = self.per_class_limits.get(label, self.default_limit)
+
+        if limit is not None and limit <= 0:
+            return
+
+        entry = (sample['score'], self.counter, sample)
+        self.counter += 1
+
+        if limit is None:
+            if self._use_heap_for_unlimited:
+                if self.global_cap is None or self.global_cap <= 0:
+                    return
+                if len(self._unlimited_entries) < self.global_cap:
+                    heappush(self._unlimited_entries, entry)
+                else:
+                    if entry[0] > self._unlimited_entries[0][0]:
+                        heapreplace(self._unlimited_entries, entry)
+            else:
+                self._unlimited_entries.append(entry)
+            return
+
+        heap = self.heaps[label]
+        if len(heap) < limit:
+            heappush(heap, entry)
+        else:
+            if entry[0] > heap[0][0]:
+                heapreplace(heap, entry)
+
+    def finalize(self) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+
+        for heap in self.heaps.values():
+            if heap:
+                top_items = nlargest(len(heap), heap)
+                results.extend(item[2] for item in top_items)
+
+        if self._use_heap_for_unlimited:
+            unlimited_items = nlargest(len(self._unlimited_entries), self._unlimited_entries)
+        else:
+            unlimited_items = sorted(self._unlimited_entries, key=lambda x: x[0], reverse=True)
+
+        results.extend(item[2] for item in unlimited_items)
+
+        results.sort(key=lambda x: x['score'], reverse=True)
+
+        trimmed = False
+        if self.global_cap is not None and self.global_cap >= 0 and len(results) > self.global_cap:
+            results = results[:self.global_cap]
+            trimmed = True
+
+        for rank, sample in enumerate(results, 1):
+            sample['rank'] = rank
+
+        self.heaps.clear()
+        self._unlimited_entries.clear()
+
+        if trimmed:
+            print(f'Applied global cap of {self.global_cap} curated samples.')
+
+        return results
+
+
 def build_transforms(image_size: int) -> Dict[str, transforms.Compose]:
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
@@ -374,14 +502,14 @@ class UnifiedInformativenessCurator:
 
         return candidate_pool
 
-    def score_dataset(
+    def score_dataset_iter(
         self,
         dataset: Dataset,
         subset_size: Optional[int],
         batch_size: int,
         num_workers: int,
         seed: int,
-    ) -> List[Dict[str, float]]:
+    ) -> Iterator[Dict[str, float]]:
         if subset_size is not None and subset_size > 0 and subset_size < len(dataset):
             generator = torch.Generator()
             generator.manual_seed(seed)
@@ -402,7 +530,7 @@ class UnifiedInformativenessCurator:
         )
 
         total_batches = math.ceil(len(working_dataset) / batch_size)
-        scored_samples: List[Dict[str, float]] = []
+        inv_num_augmentations = 1.0 / float(self.num_augmentations)
 
         with torch.inference_mode():
             for batch_idx, batch in enumerate(tqdm(loader, desc="Scoring batches", total=total_batches)):
@@ -415,7 +543,7 @@ class UnifiedInformativenessCurator:
                 pseudo_labels = probs.argmax(dim=1)
 
                 sensitivity_sum = torch.zeros(probs.size(0), device=self.device)
-                augmented_probabilities = []
+                mean_aug_prob_sum = torch.zeros_like(probs)
 
                 for _ in range(self.num_augmentations):
                     aug_inputs = torch.stack([self.augmentation_transform(img) for img in images]).to(self.device)
@@ -425,10 +553,10 @@ class UnifiedInformativenessCurator:
 
                     kl = torch.sum(probs * (log_probs - aug_log_probs), dim=1)
                     sensitivity_sum += kl
-                    augmented_probabilities.append(aug_probs)
+                    mean_aug_prob_sum += aug_probs
 
-                sensitivity = sensitivity_sum / float(self.num_augmentations)
-                mean_aug_probs = torch.stack(augmented_probabilities, dim=0).mean(dim=0)
+                sensitivity = sensitivity_sum * inv_num_augmentations
+                mean_aug_probs = mean_aug_prob_sum * inv_num_augmentations
                 potential = -(mean_aug_probs * torch.log(mean_aug_probs + self.eps)).sum(dim=1)
                 scores = self.w_sens * sensitivity + self.w_pot * potential
 
@@ -438,18 +566,32 @@ class UnifiedInformativenessCurator:
                 pseudo_labels = pseudo_labels.cpu()
 
                 for idx in range(len(paths)):
-                    scored_samples.append({
+                    yield {
                         'path': paths[idx],
                         'pseudo_label': int(pseudo_labels[idx].item()),
                         'sensitivity': float(sensitivity[idx].item()),
                         'potential': float(potential[idx].item()),
                         'score': float(scores[idx].item()),
-                    })
+                    }
 
                 # if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == total_batches:
-                #     print(f'[Scoring] Processed batch {batch_idx + 1}/{total_batches}')
+                #     print(f'[Scoring] Processed batch {batch_idx + 1}/{total_batches]')
 
-        return scored_samples
+    def score_dataset(
+        self,
+        dataset: Dataset,
+        subset_size: Optional[int],
+        batch_size: int,
+        num_workers: int,
+        seed: int,
+    ) -> List[Dict[str, float]]:
+        return list(self.score_dataset_iter(
+            dataset=dataset,
+            subset_size=subset_size,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            seed=seed,
+        ))
 
     def select_top_samples(
         self,
@@ -662,18 +804,6 @@ def load_teacher_model(args) -> torch.nn.Module:
     return teacher
 
 
-def summarize_scores(scored_samples: List[Dict[str, float]]) -> Dict[str, float]:
-    sensitivities = np.array([sample['sensitivity'] for sample in scored_samples])
-    potentials = np.array([sample['potential'] for sample in scored_samples])
-    scores = np.array([sample['score'] for sample in scored_samples])
-    return {
-        'sensitivity_mean': float(sensitivities.mean()),
-        'sensitivity_std': float(sensitivities.std()),
-        'potential_mean': float(potentials.mean()),
-        'potential_std': float(potentials.std()),
-        'score_mean': float(scores.mean()),
-        'score_std': float(scores.std()),
-    }
 
 
 def main():
@@ -774,44 +904,68 @@ def main():
     candidate_lookup = {entry['path']: entry for entry in candidate_pool}
     candidate_dataset = CandidateDataset(candidate_pool, image_loader=dataset.loader)
 
-    scored_samples = curator.score_dataset(
+    selector = PerClassSampleSelector(
+        default_limit=samples_per_class,
+        per_class_limits=per_class_sample_limits,
+        global_cap=max_total_samples,
+    )
+    summary_accumulator = ScoreSummaryAccumulator()
+    class_totals: Dict[int, int] = defaultdict(int)
+    mismatches = 0
+
+    for sample in curator.score_dataset_iter(
         dataset=candidate_dataset,
         subset_size=None,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         seed=args.seed,
-    )
-
-    mismatches = 0
-    for sample in scored_samples:
+    ):
+        summary_accumulator.update(sample)
         metadata = candidate_lookup.get(sample['path'])
-        if metadata is None:
-            continue
+        label_for_selection = sample['pseudo_label']
 
-        predicted_label = sample['pseudo_label']
-        sample['predicted_pseudo_label'] = predicted_label
-        sample['initial_pseudo_label'] = metadata['pseudo_label']
-        sample['candidate_confidence'] = metadata['candidate_confidence']
-        sample['candidate_rank'] = metadata['candidate_rank']
-        sample['pseudo_label'] = metadata['pseudo_label']
+        if metadata is not None:
+            predicted_label = label_for_selection
+            sample['predicted_pseudo_label'] = predicted_label
+            sample['initial_pseudo_label'] = metadata['pseudo_label']
+            sample['candidate_confidence'] = metadata['candidate_confidence']
+            sample['candidate_rank'] = metadata['candidate_rank']
+            label_for_selection = metadata['pseudo_label']
+            sample['pseudo_label'] = label_for_selection
 
-        if predicted_label != metadata['pseudo_label']:
-            mismatches += 1
+            if predicted_label != label_for_selection:
+                mismatches += 1
+        else:
+            sample['pseudo_label'] = label_for_selection
+
+        class_totals[label_for_selection] += 1
+        selector.add(sample)
+
+    if summary_accumulator.count == 0:
+        raise ValueError('No samples were scored. Please check the candidate pool and parameters.')
 
     if mismatches > 0:
         print(f'Warning: {mismatches} candidate(s) changed pseudo-label during augmentation scoring.')
 
-    summary = summarize_scores(scored_samples)
+    summary = summary_accumulator.to_dict()
     print('Scoring summary:')
     for key, value in summary.items():
         print(f'  {key}: {value:.6f}')
 
-    curated_samples = curator.select_top_samples(
-        scored_samples=scored_samples,
-        samples_per_class=samples_per_class,
-        max_total_samples=max_total_samples,
-        per_class_limits=per_class_sample_limits,
-    )
+    curated_samples = selector.finalize()
+
+    selected_counts: Dict[int, int] = defaultdict(int)
+    for sample in curated_samples:
+        selected_counts[sample['pseudo_label']] += 1
+
+    all_report_labels = set(class_totals.keys())
+    if per_class_sample_limits is not None:
+        all_report_labels.update(per_class_sample_limits.keys())
+
+    for label in sorted(all_report_labels):
+        available = class_totals.get(label, 0)
+        chosen = selected_counts.get(label, 0)
+        print(f'Pseudo-label {label}: selected {chosen} / {available} samples.')
 
     print(f'Total curated samples: {len(curated_samples)}')
 
