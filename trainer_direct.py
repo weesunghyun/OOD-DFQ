@@ -464,6 +464,8 @@ class Trainer(object):
 
 				self.mean_list.clear()
 				self.var_list.clear()
+				self.teacher_running_mean.clear()
+				self.teacher_running_var.clear()
 				output_teacher_batch = self.model_teacher(images)
 
 				# One hot loss
