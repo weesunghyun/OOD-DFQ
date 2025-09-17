@@ -13,9 +13,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 from torchvision.datasets.folder import default_loader
-
+from tqdm import tqdm
 from pytorchcv.model_provider import get_model as ptcv_get_model
 
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import ResNet18
 
 
@@ -71,11 +74,11 @@ def arg_parse():
                         help='Number of images sampled for scoring. Use -1 to process the full dataset.')
     parser.add_argument('--batch_size',
                         type=int,
-                        default=128,
+                        default=1024,
                         help='Batch size used during teacher inference.')
     parser.add_argument('--num_workers',
                         type=int,
-                        default=4,
+                        default=16,
                         help='Number of workers for the scoring dataloader.')
     parser.add_argument('--num_augmentations',
                         type=int,
@@ -246,7 +249,7 @@ class UnifiedInformativenessCurator:
         scored_samples: List[Dict[str, float]] = []
 
         with torch.inference_mode():
-            for batch_idx, batch in enumerate(loader):
+            for batch_idx, batch in enumerate(tqdm(loader, desc="Scoring batches", total=total_batches)):
                 images, _, paths = zip(*batch)
                 inputs = torch.stack([self.base_transform(img) for img in images]).to(self.device)
 
@@ -287,8 +290,8 @@ class UnifiedInformativenessCurator:
                         'score': float(scores[idx].item()),
                     })
 
-                if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == total_batches:
-                    print(f'[Scoring] Processed batch {batch_idx + 1}/{total_batches}')
+                # if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == total_batches:
+                #     print(f'[Scoring] Processed batch {batch_idx + 1}/{total_batches}')
 
         return scored_samples
 

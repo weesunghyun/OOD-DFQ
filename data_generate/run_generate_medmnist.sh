@@ -1,7 +1,7 @@
 #!/bin/bash
 
-medmnist_path="path-to-medmnist"
-imagenet_path="path-to-imagenet"
+medmnist_path="/home/project/dfq/medmnist"
+imagenet_path="/home/dataset/imagenet"
 datasets=(
     'dermamnist'
     'tissuemnist'
@@ -18,7 +18,7 @@ for dataset in "${datasets[@]}"; do
         --output_dir=../data/${dataset} \
         --file_prefix=resnet18_${dataset}_unified_curated \
         --subset_size=500000 \
-        --batch_size=128 \
+        --batch_size=1024 \
         --num_augmentations=5 \
         --w_sens=0.5 \
         --w_pot=0.5 \
