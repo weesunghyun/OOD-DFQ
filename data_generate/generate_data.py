@@ -6,7 +6,7 @@ import pickle
 import random
 from collections import defaultdict
 from heapq import heappush, heappushpop, heapreplace, nlargest
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -120,6 +120,14 @@ def arg_parse():
                         type=int,
                         default=None,
                         help='Total number of pseudo-labeled candidates to retain across all classes before augmentation scoring.')
+    parser.add_argument('--adaptive_min_samples_per_class',
+                        type=int,
+                        default=0,
+                        help='Minimum number of pseudo-labeled samples to retain per class during the adaptive search stage.')
+    parser.add_argument('--adaptive_sample_chunk_size',
+                        type=int,
+                        default=50000,
+                        help='Number of images processed between adaptive search status reports. Set <= 0 to disable chunk reporting.')
     parser.add_argument('--max_total_samples',
                         type=int,
                         default=None,
@@ -401,6 +409,9 @@ class UnifiedInformativenessCurator:
         num_workers: int,
         subset_size: Optional[int],
         seed: int,
+        num_classes: Optional[int] = None,
+        adaptive_min_samples_per_class: int = 0,
+        adaptive_sample_chunk_size: int = 0,
     ) -> List[Dict[str, Any]]:
         if subset_size is not None and subset_size > 0 and subset_size < len(dataset):
             generator = torch.Generator()
@@ -432,9 +443,35 @@ class UnifiedInformativenessCurator:
         candidate_heaps: Dict[int, List[Tuple[float, int, Dict[str, Any]]]] = defaultdict(list)
         candidate_lists: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
         class_counts: Dict[int, int] = defaultdict(int)
+        kept_counts: Dict[int, int] = defaultdict(int)
+        applied_limits: Dict[int, Optional[int]] = {}
         candidate_counter = 0
 
+        adaptive_target = adaptive_min_samples_per_class if adaptive_min_samples_per_class and adaptive_min_samples_per_class > 0 else None
+        chunk_size = None
+        if adaptive_target is not None and adaptive_sample_chunk_size and adaptive_sample_chunk_size > 0:
+            chunk_size = adaptive_sample_chunk_size
+        processed_samples = 0
+        next_report = chunk_size if chunk_size is not None else None
+
+        pending_labels: Set[int] = set()
+        pending_limit_labels: Set[int] = set()
+        dynamic_pending = False
+        if adaptive_target is not None:
+            if num_classes is not None and num_classes > 0:
+                pending_labels = set(range(num_classes))
+            else:
+                dynamic_pending = True
+                print(
+                    'Warning: adaptive_min_samples_per_class was provided without a known number of teacher classes. '
+                    'Adaptive balancing will track labels as they are observed.'
+                )
+
+        limit_adjustment_notified: Set[int] = set()
+        zero_limit_notified: Set[int] = set()
+
         with torch.inference_mode():
+            completion_reached = False
             for batch in tqdm(loader, desc="Pseudo-labeling batches", total=total_batches):
                 images, _, paths = zip(*batch)
                 inputs = torch.stack([self.base_transform(img) for img in images]).to(self.device)
@@ -450,34 +487,129 @@ class UnifiedInformativenessCurator:
                     class_counts[label] += 1
                     candidate_counter += 1
 
+                    if adaptive_target is not None and dynamic_pending and label not in pending_labels:
+                        pending_labels.add(label)
+
+                    limit = candidate_limits.get(label, default_candidate_limit)
+                    effective_limit = limit
+
+                    if adaptive_target is not None:
+                        target = adaptive_target
+                        if effective_limit is None:
+                            effective_limit = target
+                        elif effective_limit < target:
+                            if label not in limit_adjustment_notified:
+                                print(
+                                    f'Increasing candidate limit for pseudo-label {label} '
+                                    f'from {effective_limit} to satisfy adaptive minimum of {target}.'
+                                )
+                                limit_adjustment_notified.add(label)
+                            effective_limit = target
+
+                    if effective_limit is not None and effective_limit <= 0:
+                        applied_limits[label] = effective_limit
+                        if adaptive_target is not None and label in pending_labels and label not in zero_limit_notified:
+                            print(
+                                f'Warning: pseudo-label {label} has a non-positive candidate limit; '
+                                'it will be excluded from adaptive balancing.'
+                            )
+                            zero_limit_notified.add(label)
+                            pending_labels.discard(label)
+
+                        pending_limit_labels.discard(label)
+
+                        processed_samples += 1
+                        if chunk_size is not None and next_report is not None and processed_samples >= next_report:
+                            remaining = sorted(pending_labels)
+                            remaining_display = remaining if remaining else 'None'
+                            print(
+                                f'[Adaptive Search] Processed {processed_samples} samples. '
+                                f'Remaining classes below target: {remaining_display}. '
+                                f'Current pool sizes: {sum(kept_counts.values())}'
+                            )
+                            next_report += chunk_size
+
+                        continue
+
+                    applied_limits[label] = effective_limit
+
                     entry: Dict[str, Any] = {
                         'path': paths[idx],
                         'pseudo_label': label,
                         'candidate_confidence': confidence,
                     }
 
-                    limit = candidate_limits.get(label, default_candidate_limit)
-                    if limit is not None and limit <= 0:
-                        continue
-
-                    if limit is None:
+                    stored = False
+                    if effective_limit is None:
                         candidate_lists[label].append(entry)
+                        kept_counts[label] = len(candidate_lists[label])
+                        stored = True
                     else:
                         heap_entry = (confidence, candidate_counter, entry)
                         heap = candidate_heaps[label]
-                        if len(heap) < limit:
+                        if len(heap) < effective_limit:
                             heappush(heap, heap_entry)
+                            stored = True
                         else:
-                            heappushpop(heap, heap_entry)
+                            popped = heappushpop(heap, heap_entry)
+                            stored = popped[2] is not entry
+                        kept_counts[label] = len(heap)
+
+                    if effective_limit is not None:
+                        if kept_counts[label] >= effective_limit:
+                            pending_limit_labels.discard(label)
+                        else:
+                            pending_limit_labels.add(label)
+                    else:
+                        pending_limit_labels.discard(label)
+
+                    if adaptive_target is not None and stored:
+                        if kept_counts[label] >= adaptive_target and label in pending_labels:
+                            pending_labels.discard(label)
+
+                    processed_samples += 1
+                    if chunk_size is not None and next_report is not None and processed_samples >= next_report:
+                        remaining = sorted(pending_labels)
+                        remaining_display = remaining if remaining else 'None'
+                        print(
+                            f'[Adaptive Search] Processed {processed_samples} samples. '
+                            f'Remaining classes below target: {remaining_display}. '
+                            f'Current pool sizes: {sum(kept_counts.values())}'
+                        )
+                        next_report += chunk_size
+
+                    if adaptive_target is not None and not pending_labels and not pending_limit_labels:
+                        completion_reached = True
+                        break
+
+                if completion_reached:
+                    break
+
+        if adaptive_target is not None:
+            if pending_labels:
+                print('Warning: Unable to satisfy adaptive minimum for the following pseudo-labels:')
+                for label in sorted(pending_labels):
+                    print(
+                        f'  class {label}: gathered {kept_counts.get(label, 0)} / {adaptive_target} candidates '
+                        f'(total seen: {class_counts.get(label, 0)})'
+                    )
+            else:
+                print(
+                    'Adaptive search satisfied the minimum candidate requirement for all pseudo-labels '
+                    f'({adaptive_target} per class).'
+                )
 
         candidate_pool: List[Dict[str, Any]] = []
         total_candidates = 0
 
         all_labels = set(class_counts.keys())
         all_labels.update(candidate_limits.keys())
+        all_labels.update(applied_limits.keys())
 
         for label in sorted(all_labels):
-            limit = candidate_limits.get(label, default_candidate_limit)
+            limit = applied_limits.get(label)
+            if limit is None:
+                limit = candidate_limits.get(label, default_candidate_limit)
 
             if limit is None:
                 label_candidates = candidate_lists[label]
@@ -896,6 +1028,9 @@ def main():
         num_workers=args.num_workers,
         subset_size=subset_size,
         seed=args.seed,
+        num_classes=num_teacher_classes,
+        adaptive_min_samples_per_class=args.adaptive_min_samples_per_class,
+        adaptive_sample_chunk_size=args.adaptive_sample_chunk_size,
     )
 
     if not candidate_pool:
