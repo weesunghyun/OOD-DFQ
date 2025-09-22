@@ -5,7 +5,7 @@ import os
 import pickle
 import random
 from collections import defaultdict
-from heapq import heappush, heappushpop, heapreplace, nlargest
+from heapq import heappush, heappushpop, nlargest
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
@@ -272,10 +272,9 @@ class PerClassSampleSelector:
         self.default_limit = default_limit
         self.per_class_limits = per_class_limits or {}
         self.global_cap = global_cap
-        self.heaps: Dict[int, List[Tuple[float, int, Dict[str, Any]]]] = defaultdict(list)
+        self.entries_by_class: Dict[int, List[Tuple[float, int, Dict[str, Any]]]] = defaultdict(list)
+        self.unlimited_entries: List[Tuple[float, int, Dict[str, Any]]] = []
         self.counter = 0
-        self._use_heap_for_unlimited = global_cap is not None
-        self._unlimited_entries: List[Tuple[float, int, Dict[str, Any]]] = []
 
     def add(self, sample: Dict[str, Any]) -> None:
         label = sample['pseudo_label']
@@ -288,39 +287,93 @@ class PerClassSampleSelector:
         self.counter += 1
 
         if limit is None:
-            if self._use_heap_for_unlimited:
-                if self.global_cap is None or self.global_cap <= 0:
-                    return
-                if len(self._unlimited_entries) < self.global_cap:
-                    heappush(self._unlimited_entries, entry)
-                else:
-                    if entry[0] > self._unlimited_entries[0][0]:
-                        heapreplace(self._unlimited_entries, entry)
-            else:
-                self._unlimited_entries.append(entry)
-            return
-
-        heap = self.heaps[label]
-        if len(heap) < limit:
-            heappush(heap, entry)
+            self.unlimited_entries.append(entry)
         else:
-            if entry[0] > heap[0][0]:
-                heapreplace(heap, entry)
+            self.entries_by_class[label].append(entry)
 
     def finalize(self) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
+        surplus_entries: List[Tuple[float, int, Dict[str, Any]]] = []
+        unlimited_entries: List[Tuple[float, int, Dict[str, Any]]] = []
 
-        for heap in self.heaps.values():
-            if heap:
-                top_items = nlargest(len(heap), heap)
-                results.extend(item[2] for item in top_items)
+        labels_to_process: Set[int] = set(self.entries_by_class.keys())
+        if self.per_class_limits:
+            labels_to_process.update(self.per_class_limits.keys())
 
-        if self._use_heap_for_unlimited:
-            unlimited_items = nlargest(len(self._unlimited_entries), self._unlimited_entries)
+        for label in sorted(labels_to_process):
+            entries = self.entries_by_class.get(label, [])
+            if not entries:
+                continue
+
+            limit = self.per_class_limits.get(label, self.default_limit)
+            sorted_entries = sorted(entries, key=lambda x: (-x[0], x[1]))
+
+            if limit is None:
+                unlimited_entries.extend(sorted_entries)
+                continue
+
+            if limit <= 0:
+                continue
+
+            take = min(len(sorted_entries), limit)
+            if take:
+                results.extend(item[2] for item in sorted_entries[:take])
+            surplus_entries.extend(sorted_entries[take:])
+
+        if self.unlimited_entries:
+            unlimited_entries.extend(self.unlimited_entries)
+
+        target_total: Optional[int] = None
+        effective_global_cap = (
+            self.global_cap if self.global_cap is None or self.global_cap >= 0 else None
+        )
+        if self.per_class_limits:
+            target_total = sum(
+                max(limit, 0)
+                for limit in self.per_class_limits.values()
+                if limit is not None
+            )
+
+        desired_total: Optional[int] = target_total
+        if effective_global_cap is not None:
+            if desired_total is None:
+                desired_total = effective_global_cap
+            else:
+                desired_total = min(desired_total, effective_global_cap)
+
+        if desired_total is None:
+            if unlimited_entries:
+                unlimited_entries.sort(key=lambda x: (-x[0], x[1]))
+                results.extend(item[2] for item in unlimited_entries)
         else:
-            unlimited_items = sorted(self._unlimited_entries, key=lambda x: x[0], reverse=True)
+            combined_pool: List[Tuple[float, int, Dict[str, Any]]] = []
+            if surplus_entries:
+                combined_pool.extend(surplus_entries)
+            if unlimited_entries:
+                combined_pool.extend(unlimited_entries)
 
-        results.extend(item[2] for item in unlimited_items)
+            available_total = len(results) + len(combined_pool)
+            if combined_pool:
+                combined_pool.sort(key=lambda x: (-x[0], x[1]))
+
+            if len(results) < desired_total and combined_pool:
+                needed = desired_total - len(results)
+                additions = combined_pool[:needed]
+                if additions:
+                    results.extend(item[2] for item in additions)
+                    print(
+                        f'Reallocated {len(additions)} sample(s) across pseudo-labels '
+                        f'to satisfy the total target of {desired_total}.'
+                    )
+
+            if len(results) < desired_total:
+                warning = (
+                    f'Warning: Only collected {len(results)} curated samples '
+                    f'out of the desired total of {desired_total} after reallocation.'
+                )
+                if available_total < desired_total:
+                    warning += f' Available candidates after pooling: {available_total}.'
+                print(warning)
 
         results.sort(key=lambda x: x['score'], reverse=True)
 
@@ -332,8 +385,8 @@ class PerClassSampleSelector:
         for rank, sample in enumerate(results, 1):
             sample['rank'] = rank
 
-        self.heaps.clear()
-        self._unlimited_entries.clear()
+        self.entries_by_class.clear()
+        self.unlimited_entries.clear()
 
         if trimmed:
             print(f'Applied global cap of {self.global_cap} curated samples.')
