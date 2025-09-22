@@ -323,6 +323,15 @@ class PerClassSampleSelector:
                 if limit is not None
             )
 
+        if (
+            target_total is None
+            and self.default_limit is not None
+            and self.default_limit > 0
+        ):
+            observed_classes = len(self.entries_by_class)
+            if observed_classes > 0:
+                target_total = self.default_limit * observed_classes
+
         if target_total is None and effective_global_cap is not None:
             target_total = effective_global_cap
         elif target_total is not None and effective_global_cap is not None:
