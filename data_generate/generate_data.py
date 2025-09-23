@@ -1245,18 +1245,36 @@ def run_feature_diversity_sampling(
     subset_size: Optional[int],
 ) -> List[Dict[str, Any]]:
     summary_accumulator = ScoreSummaryAccumulator()
+    candidate_pool_size = args.feature_candidate_pool_size
+    collect_all = candidate_pool_size is None or candidate_pool_size <= 0
+
     scored_samples: List[Dict[str, Any]] = []
-    for sample in curator.score_dataset_iter(
-        dataset=dataset,
-        subset_size=subset_size,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        seed=args.seed,
+    topk_heap: List[Tuple[float, int, Dict[str, Any]]] = []
+    total_scored = 0
+
+    for sample_index, sample in enumerate(
+        curator.score_dataset_iter(
+            dataset=dataset,
+            subset_size=subset_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            seed=args.seed,
+        )
     ):
         summary_accumulator.update(sample)
-        scored_samples.append(dict(sample))
+        total_scored += 1
 
-    if not scored_samples:
+        if collect_all:
+            scored_samples.append(dict(sample))
+            continue
+
+        score = sample['score']
+        if len(topk_heap) < candidate_pool_size:
+            heappush(topk_heap, (score, sample_index, dict(sample)))
+        elif score > topk_heap[0][0]:
+            heappushpop(topk_heap, (score, sample_index, dict(sample)))
+
+    if total_scored == 0:
         raise ValueError('No samples were scored when performing feature-diversity sampling.')
 
     summary = summary_accumulator.to_dict()
@@ -1264,15 +1282,13 @@ def run_feature_diversity_sampling(
     for key, value in summary.items():
         print(f'  {key}: {value:.6f}')
 
-    candidate_pool_size = args.feature_candidate_pool_size
-    if candidate_pool_size is None or candidate_pool_size <= 0:
+    if collect_all:
         candidate_pool = scored_samples
     else:
-        candidate_pool = nlargest(
-            min(candidate_pool_size, len(scored_samples)),
-            scored_samples,
-            key=lambda item: item['score'],
-        )
+        candidate_pool = [
+            entry[2]
+            for entry in sorted(topk_heap, key=lambda item: (-item[0], item[1]))
+        ]
 
     print(f'Candidate pool size after informativeness filtering: {len(candidate_pool)}')
 
