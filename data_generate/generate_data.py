@@ -335,13 +335,13 @@ class PerClassSampleSelector:
 
     def finalize(self) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
-        reallocation_pool: List[Tuple[float, int, Dict[str, Any]]] = []
+        reallocation_pool_by_label: Dict[int, List[Tuple[float, int, Dict[str, Any]]]] = defaultdict(list)
 
         for label, entries in self.entries_by_class.items():
             limit = self.per_class_limits.get(label, self.default_limit)
 
             if limit is None:
-                reallocation_pool.extend(entries)
+                reallocation_pool_by_label[label].extend(entries)
                 continue
 
             if limit <= 0:
@@ -350,7 +350,7 @@ class PerClassSampleSelector:
             sorted_entries = sorted(entries, key=lambda x: (-x[0], x[1]))
             selected = sorted_entries[:limit]
             results.extend(item[2] for item in selected)
-            reallocation_pool.extend(sorted_entries[limit:])
+            reallocation_pool_by_label[label].extend(sorted_entries[limit:])
 
         unlimited_sorted = sorted(self.unlimited_entries, key=lambda x: (-x[0], x[1]))
 
@@ -382,23 +382,80 @@ class PerClassSampleSelector:
         if target_total is None:
             results.extend(item[2] for item in unlimited_sorted)
         else:
-            reallocation_pool.extend(unlimited_sorted)
-            if len(results) < target_total and reallocation_pool:
+            for entry in unlimited_sorted:
+                sample_label = entry[2]['pseudo_label']
+                reallocation_pool_by_label[sample_label].append(entry)
+
+            if len(results) < target_total:
                 needed = target_total - len(results)
-                reallocation_pool.sort(key=lambda x: (-x[0], x[1]))
-                additions = reallocation_pool[:needed]
-                if additions:
-                    results.extend(item[2] for item in additions)
+
+                for entries in reallocation_pool_by_label.values():
+                    entries.sort(key=lambda x: (-x[0], x[1]))
+
+                added_total = 0
+                redistribution_attempted = False
+                available_labels = sorted(
+                    label for label, entries in reallocation_pool_by_label.items() if entries
+                )
+
+                while needed > 0 and available_labels:
+                    redistribution_attempted = True
+                    even_targets = compute_even_class_targets(needed, len(available_labels))
+                    progress_made = False
+
+                    next_available_labels: List[int] = []
+                    for idx, label in enumerate(available_labels):
+                        desired = even_targets.get(idx, 0)
+                        if desired <= 0:
+                            if reallocation_pool_by_label[label]:
+                                next_available_labels.append(label)
+                            continue
+
+                        entries = reallocation_pool_by_label[label]
+                        if not entries:
+                            continue
+
+                        take_count = min(desired, len(entries))
+                        if take_count <= 0:
+                            if entries:
+                                next_available_labels.append(label)
+                            continue
+
+                        selected_entries = entries[:take_count]
+                        results.extend(item[2] for item in selected_entries)
+                        reallocation_pool_by_label[label] = entries[take_count:]
+                        needed -= take_count
+                        added_total += take_count
+                        progress_made = True
+
+                        if reallocation_pool_by_label[label]:
+                            next_available_labels.append(label)
+
+                    if not progress_made:
+                        break
+
+                    available_labels = next_available_labels
+
+                if added_total > 0:
                     print(
-                        f'Reallocated {len(additions)} sample(s) across pseudo-labels '
-                        f'to satisfy the total target of {target_total}.'
+                        f'Reallocated {added_total} sample(s) across pseudo-labels '
+                        f'as evenly as possible to satisfy the total target of {target_total}.'
                     )
 
             if len(results) < target_total:
-                print(
-                    f'Warning: Only collected {len(results)} curated samples '
-                    f'out of the desired total of {target_total} after reallocation.'
-                )
+                if redistribution_attempted:
+                    print(
+                        f'Warning: After even redistribution across pseudo-labels, '
+                        f'only collected {len(results)} curated samples out of the desired total '
+                        f'of {target_total}.'
+                    )
+                else:
+                    print(
+                        f'Warning: Unable to perform even redistribution across pseudo-labels '
+                        f'due to insufficient leftover candidates. '
+                        f'Collected {len(results)} curated samples out of the desired total '
+                        f'of {target_total}.'
+                    )
 
         results.sort(key=lambda x: x['score'], reverse=True)
 
