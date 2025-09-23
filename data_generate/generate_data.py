@@ -4,18 +4,24 @@ import math
 import os
 import pickle
 import random
-from collections import defaultdict
+from collections import Counter, defaultdict
 from heapq import heappush, heappushpop, nlargest
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 from torchvision.datasets.folder import default_loader
 from tqdm import tqdm
 from pytorchcv.model_provider import get_model as ptcv_get_model
+
+try:
+    from sklearn.cluster import MiniBatchKMeans
+except ImportError:  # pragma: no cover - optional dependency
+    MiniBatchKMeans = None
 
 import sys
 import os
@@ -148,6 +154,42 @@ def arg_parse():
                         type=int,
                         default=None,
                         help='Total number of curated samples to keep across all classes after augmentation scoring.')
+    parser.add_argument('--sampling_strategy',
+                        type=str,
+                        default='pseudo_label',
+                        choices=['pseudo_label', 'feature_diversity', 'meta_label'],
+                        help='Sampling strategy used to construct the curated dataset.')
+    parser.add_argument('--feature_candidate_pool_size',
+                        type=int,
+                        default=50000,
+                        help='Top-K samples retained before clustering when using feature-diversity sampling. '
+                             'Use <= 0 to disable pre-filtering.')
+    parser.add_argument('--feature_cluster_count',
+                        type=int,
+                        default=100,
+                        help='Number of Mini-Batch K-Means clusters for feature-diversity sampling.')
+    parser.add_argument('--feature_samples_per_cluster',
+                        type=int,
+                        default=None,
+                        help='Number of samples retained per cluster for feature-diversity sampling. '
+                             'If omitted, the total target is evenly distributed across clusters.')
+    parser.add_argument('--meta_top_n',
+                        type=int,
+                        default=3,
+                        help='Number of top teacher predictions used to form meta-labels.')
+    parser.add_argument('--meta_label_top_k',
+                        type=int,
+                        default=50,
+                        help='Number of most frequent meta-label groups kept during meta-label sampling.')
+    parser.add_argument('--meta_samples_per_group',
+                        type=int,
+                        default=None,
+                        help='Optional fixed number of samples per meta-label group when using meta-label sampling. '
+                             'If omitted, the total target is divided evenly across groups.')
+    parser.add_argument('--meta_include_others',
+                        action='store_true',
+                        help='Include the aggregated "others" meta-label bucket during reallocation when using '
+                             'meta-label sampling.')
     parser.add_argument('--seed',
                         type=int,
                         default=42,
@@ -677,6 +719,7 @@ class UnifiedInformativenessCurator:
         batch_size: int,
         num_workers: int,
         seed: int,
+        top_n: Optional[int] = None,
     ) -> Iterator[Dict[str, float]]:
         if subset_size is not None and subset_size > 0 and subset_size < len(dataset):
             generator = torch.Generator()
@@ -733,14 +776,27 @@ class UnifiedInformativenessCurator:
                 scores = scores.cpu()
                 pseudo_labels = pseudo_labels.cpu()
 
+                sorted_top_indices: Optional[torch.Tensor] = None
+                if top_n is not None and top_n > 0:
+                    top_k = min(top_n, probs.size(1))
+                    top_indices = torch.topk(probs, k=top_k, dim=1).indices
+                    sorted_top_indices = torch.sort(top_indices, dim=1).values.cpu()
+
                 for idx in range(len(paths)):
-                    yield {
+                    sample: Dict[str, Any] = {
                         'path': paths[idx],
                         'pseudo_label': int(pseudo_labels[idx].item()),
                         'sensitivity': float(sensitivity[idx].item()),
                         'potential': float(potential[idx].item()),
                         'score': float(scores[idx].item()),
                     }
+
+                    if sorted_top_indices is not None:
+                        indices_list = [int(v) for v in sorted_top_indices[idx].tolist()]
+                        sample['top_n_indices'] = indices_list
+                        sample['meta_label'] = tuple(indices_list)
+
+                    yield sample
 
                 # if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == total_batches:
                 #     print(f'[Scoring] Processed batch {batch_idx + 1}/{total_batches]')
@@ -752,6 +808,7 @@ class UnifiedInformativenessCurator:
         batch_size: int,
         num_workers: int,
         seed: int,
+        top_n: Optional[int] = None,
     ) -> List[Dict[str, float]]:
         return list(self.score_dataset_iter(
             dataset=dataset,
@@ -759,7 +816,78 @@ class UnifiedInformativenessCurator:
             batch_size=batch_size,
             num_workers=num_workers,
             seed=seed,
+            top_n=top_n,
         ))
+
+    def extract_features(
+        self,
+        dataset: Dataset,
+        batch_size: int,
+        num_workers: int,
+    ) -> np.ndarray:
+        """Extracts penultimate features for the provided dataset."""
+
+        linear_layer: Optional[nn.Module] = None
+        for module in self.teacher_model.modules():
+            if isinstance(module, nn.Linear):
+                linear_layer = module
+
+        if linear_layer is None:
+            raise ValueError(
+                'Unable to locate a Linear layer in the teacher model for feature extraction.'
+            )
+
+        captured_batches: List[np.ndarray] = []
+        all_features: List[np.ndarray] = []
+
+        def hook(module: nn.Module, inputs: Tuple[torch.Tensor, ...], output: torch.Tensor) -> None:
+            if not inputs:
+                return
+            features = inputs[0]
+            if not isinstance(features, torch.Tensor):
+                return
+            captured_batches.append(features.detach().cpu().numpy())
+
+        handle = linear_layer.register_forward_hook(hook)
+
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+            collate_fn=lambda batch: batch,
+        )
+
+        try:
+            with torch.inference_mode():
+                for batch in tqdm(loader, desc="Extracting features"):
+                    captured_batches.clear()
+                    images, _, _ = zip(*batch)
+                    inputs = torch.stack([
+                        self.base_transform(img) for img in images
+                    ]).to(self.device)
+                    _ = self.teacher_model(inputs)
+
+                    if not captured_batches:
+                        raise RuntimeError('Feature hook did not capture outputs for the batch.')
+
+                    # Use the first captured batch (there should be only one per forward)
+                    batch_features = captured_batches[0]
+                    if batch_features.shape[0] != len(images):
+                        raise RuntimeError(
+                            'Mismatch between captured features and batch size during feature extraction.'
+                        )
+
+                    all_features.append(batch_features)
+
+        finally:
+            handle.remove()
+
+        if not all_features:
+            return np.empty((0, 0), dtype=np.float32)
+
+        return np.concatenate(all_features, axis=0)
 
     def select_top_samples(
         self,
@@ -972,56 +1100,21 @@ def load_teacher_model(args) -> torch.nn.Module:
     return teacher
 
 
-
-
-def main():
-    args = arg_parse()
-    set_seed(args.seed)
-
-    if not os.path.isdir(args.dataset_path):
-        raise ValueError(f'Dataset path {args.dataset_path} does not exist or is not a directory.')
-
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True
-
-    teacher_model = load_teacher_model(args)
-
-    transforms_dict = build_transforms(args.image_size)
-    dataset = ImageFolderWithPaths(root=args.dataset_path, transform=None)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    curator = UnifiedInformativenessCurator(
-        teacher_model=teacher_model,
-        base_transform=transforms_dict['base'],
-        augmentation_transform=transforms_dict['augment'],
-        w_sens=args.w_sens,
-        w_pot=args.w_pot,
-        num_augmentations=args.num_augmentations,
-        device=device,
-        image_loader=dataset.loader,
-    )
-
-    subset_size = None if args.subset_size in (-1, None) else args.subset_size
-
-    if args.dataset is not None and args.dataset in CLASSIFICATION_DATASETS:
-        num_teacher_classes = CLASSIFICATION_DATASETS[args.dataset]
-    else:
-        num_teacher_classes = getattr(curator.teacher_model, 'num_classes', None)
-        if num_teacher_classes is None:
-            with torch.inference_mode():
-                dummy = torch.zeros(1, 3, args.image_size, args.image_size, device=device)
-                logits = curator.teacher_model(dummy)
-                num_teacher_classes = logits.shape[1]
-
-    if num_teacher_classes is None:
-        raise ValueError('Unable to determine the number of pseudo-label classes for distribution.')
-
+def run_pseudo_label_sampling(
+    curator: "UnifiedInformativenessCurator",
+    dataset: ImageFolderWithPaths,
+    args: argparse.Namespace,
+    subset_size: Optional[int],
+    num_teacher_classes: int,
+) -> List[Dict[str, Any]]:
     candidate_pool_per_class = args.candidate_pool_per_class
     candidate_pool_targets = None
     if args.total_candidate_pool is not None:
         if args.total_candidate_pool <= 0:
             raise ValueError('--total_candidate_pool must be positive when provided.')
-        candidate_pool_targets = compute_even_class_targets(args.total_candidate_pool, num_teacher_classes)
+        candidate_pool_targets = compute_even_class_targets(
+            args.total_candidate_pool, num_teacher_classes
+        )
         candidate_pool_per_class = None
         print(
             f'Distributing total candidate pool of {args.total_candidate_pool} '
@@ -1036,7 +1129,9 @@ def main():
     if args.total_samples is not None:
         if args.total_samples <= 0:
             raise ValueError('--total_samples must be positive when provided.')
-        per_class_sample_limits = compute_even_class_targets(args.total_samples, num_teacher_classes)
+        per_class_sample_limits = compute_even_class_targets(
+            args.total_samples, num_teacher_classes
+        )
         samples_per_class = None
         print(
             f'Distributing total curated sample target of {args.total_samples} '
@@ -1139,6 +1234,380 @@ def main():
         print(f'Pseudo-label {label}: selected {chosen} / {available} samples.')
 
     print(f'Total curated samples: {len(curated_samples)}')
+
+    return curated_samples
+
+
+def run_feature_diversity_sampling(
+    curator: "UnifiedInformativenessCurator",
+    dataset: ImageFolderWithPaths,
+    args: argparse.Namespace,
+    subset_size: Optional[int],
+) -> List[Dict[str, Any]]:
+    summary_accumulator = ScoreSummaryAccumulator()
+    scored_samples: List[Dict[str, Any]] = []
+    for sample in curator.score_dataset_iter(
+        dataset=dataset,
+        subset_size=subset_size,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        seed=args.seed,
+    ):
+        summary_accumulator.update(sample)
+        scored_samples.append(dict(sample))
+
+    if not scored_samples:
+        raise ValueError('No samples were scored when performing feature-diversity sampling.')
+
+    summary = summary_accumulator.to_dict()
+    print('Scoring summary:')
+    for key, value in summary.items():
+        print(f'  {key}: {value:.6f}')
+
+    candidate_pool_size = args.feature_candidate_pool_size
+    if candidate_pool_size is None or candidate_pool_size <= 0:
+        candidate_pool = scored_samples
+    else:
+        candidate_pool = nlargest(
+            min(candidate_pool_size, len(scored_samples)),
+            scored_samples,
+            key=lambda item: item['score'],
+        )
+
+    print(f'Candidate pool size after informativeness filtering: {len(candidate_pool)}')
+
+    if MiniBatchKMeans is None:
+        raise ImportError(
+            'scikit-learn is required for feature-diversity sampling. '
+            'Please install it to use this strategy.'
+        )
+
+    candidate_dataset = CandidateDataset(candidate_pool, image_loader=dataset.loader)
+    features = curator.extract_features(
+        dataset=candidate_dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    )
+
+    if features.shape[0] != len(candidate_pool):
+        raise RuntimeError('Feature extraction count mismatch with candidate pool.')
+
+    num_clusters = min(args.feature_cluster_count, len(candidate_pool))
+    if num_clusters <= 0:
+        raise ValueError('Number of clusters for feature-diversity sampling must be positive.')
+
+    mbatch = MiniBatchKMeans(
+        n_clusters=num_clusters,
+        batch_size=min(args.batch_size, len(candidate_pool)),
+        random_state=args.seed,
+    )
+    cluster_ids = mbatch.fit_predict(features)
+
+    clusters: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for entry, cluster_id in zip(candidate_pool, cluster_ids):
+        sample = dict(entry)
+        sample['feature_cluster'] = int(cluster_id)
+        clusters[int(cluster_id)].append(sample)
+
+    total_target: Optional[int] = None
+    if args.total_samples is not None and args.total_samples > 0:
+        total_target = args.total_samples
+    elif args.max_total_samples is not None and args.max_total_samples > 0:
+        total_target = args.max_total_samples
+
+    per_cluster_counts: List[int]
+    if args.feature_samples_per_cluster is not None and args.feature_samples_per_cluster > 0:
+        desired_total = args.feature_samples_per_cluster * num_clusters
+        if total_target is not None and total_target < desired_total:
+            base = total_target // num_clusters
+            remainder = total_target % num_clusters
+            per_cluster_counts = [
+                base + (1 if idx < remainder else 0)
+                for idx in range(num_clusters)
+            ]
+        else:
+            per_cluster_counts = [args.feature_samples_per_cluster] * num_clusters
+            total_target = desired_total
+    else:
+        if total_target is None:
+            total_target = len(candidate_pool)
+        base = total_target // num_clusters
+        remainder = total_target % num_clusters
+        per_cluster_counts = [
+            base + (1 if idx < remainder else 0)
+            for idx in range(num_clusters)
+        ]
+
+    selected: List[Dict[str, Any]] = []
+    leftovers: List[Dict[str, Any]] = []
+
+    for cluster_id in range(num_clusters):
+        cluster_samples = clusters.get(cluster_id, [])
+        cluster_samples.sort(key=lambda item: item['score'], reverse=True)
+        limit = per_cluster_counts[cluster_id] if cluster_id < len(per_cluster_counts) else 0
+        if limit <= 0:
+            continue
+
+        chosen = cluster_samples[:limit]
+        selected.extend(chosen)
+        leftovers.extend(cluster_samples[limit:])
+
+        if len(chosen) < limit:
+            print(
+                f'Cluster {cluster_id}: only {len(chosen)} samples available '
+                f'for the requested {limit}. '
+            )
+        else:
+            print(
+                f'Cluster {cluster_id}: selected top {limit} of {len(cluster_samples)} samples.'
+            )
+
+    if total_target is not None and len(selected) < total_target:
+        needed = total_target - len(selected)
+        if leftovers:
+            leftovers.sort(key=lambda item: item['score'], reverse=True)
+            additions = leftovers[:needed]
+            if additions:
+                selected.extend(additions)
+                print(
+                    f'Filled remaining quota with {len(additions)} samples from the leftovers.'
+                )
+        if len(selected) < total_target:
+            print(
+                f'Warning: feature-diversity sampling gathered {len(selected)} '
+                f'samples but the target was {total_target}.'
+            )
+
+    if total_target is not None and len(selected) > total_target:
+        selected.sort(key=lambda item: item['score'], reverse=True)
+        selected = selected[:total_target]
+        print(f'Trimmed selection to the target of {total_target} samples.')
+
+    print(f'Total curated samples: {len(selected)}')
+    return selected
+
+
+def run_meta_label_sampling(
+    curator: "UnifiedInformativenessCurator",
+    dataset: ImageFolderWithPaths,
+    args: argparse.Namespace,
+    subset_size: Optional[int],
+) -> List[Dict[str, Any]]:
+    if args.meta_top_n <= 0:
+        raise ValueError('--meta_top_n must be positive when using meta-label sampling.')
+
+    summary_accumulator = ScoreSummaryAccumulator()
+    scored_samples: List[Dict[str, Any]] = []
+
+    for sample in curator.score_dataset_iter(
+        dataset=dataset,
+        subset_size=subset_size,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        top_n=args.meta_top_n,
+    ):
+        if 'meta_label' not in sample:
+            raise RuntimeError('Meta-label information was not produced during scoring.')
+        summary_accumulator.update(sample)
+        scored_samples.append(dict(sample))
+
+    if not scored_samples:
+        raise ValueError('No samples were scored when performing meta-label sampling.')
+
+    summary = summary_accumulator.to_dict()
+    print('Scoring summary:')
+    for key, value in summary.items():
+        print(f'  {key}: {value:.6f}')
+
+    counter: Counter = Counter(sample['meta_label'] for sample in scored_samples)
+    most_common = counter.most_common(args.meta_label_top_k)
+
+    if not most_common:
+        raise ValueError('No meta-label groups were identified from the teacher predictions.')
+
+    valid_meta_labels = [entry[0] for entry in most_common]
+    valid_set = set(valid_meta_labels)
+
+    print('Top meta-label groups:')
+    for label, freq in most_common:
+        print(f'  {label}: {freq} samples')
+
+    grouped: Dict[Optional[Tuple[int, ...]], List[Dict[str, Any]]] = defaultdict(list)
+    for sample in scored_samples:
+        meta_label = sample['meta_label']
+        group_key: Optional[Tuple[int, ...]]
+        if meta_label in valid_set:
+            group_key = meta_label
+        else:
+            group_key = None
+        grouped[group_key].append(sample)
+
+    total_target: Optional[int] = None
+    if args.total_samples is not None and args.total_samples > 0:
+        total_target = args.total_samples
+    elif args.max_total_samples is not None and args.max_total_samples > 0:
+        total_target = args.max_total_samples
+
+    per_group_counts: List[int]
+    if args.meta_samples_per_group is not None and args.meta_samples_per_group > 0:
+        desired_total = args.meta_samples_per_group * len(valid_meta_labels)
+        if total_target is not None and total_target < desired_total:
+            base = total_target // len(valid_meta_labels)
+            remainder = total_target % len(valid_meta_labels)
+            per_group_counts = [
+                base + (1 if idx < remainder else 0)
+                for idx in range(len(valid_meta_labels))
+            ]
+        else:
+            per_group_counts = [args.meta_samples_per_group] * len(valid_meta_labels)
+            total_target = desired_total
+    else:
+        if total_target is None:
+            raise ValueError(
+                'Meta-label sampling requires either --total_samples or --meta_samples_per_group.'
+            )
+        base = total_target // len(valid_meta_labels)
+        remainder = total_target % len(valid_meta_labels)
+        per_group_counts = [
+            base + (1 if idx < remainder else 0)
+            for idx in range(len(valid_meta_labels))
+        ]
+
+    selected: List[Dict[str, Any]] = []
+    leftovers: List[Dict[str, Any]] = []
+
+    for idx, meta_label in enumerate(valid_meta_labels):
+        group_samples = grouped.get(meta_label, [])
+        group_samples.sort(key=lambda item: item['score'], reverse=True)
+        limit = per_group_counts[idx]
+        if limit <= 0:
+            continue
+
+        chosen = group_samples[:limit]
+        for entry in chosen:
+            entry['meta_label'] = list(entry['meta_label'])
+        selected.extend(chosen)
+        leftovers.extend(group_samples[limit:])
+
+        if len(chosen) < limit:
+            print(
+                f'Meta-label {meta_label}: only {len(chosen)} samples available '
+                f'for the requested {limit}.'
+            )
+        else:
+            print(
+                f'Meta-label {meta_label}: selected top {limit} of {len(group_samples)} samples.'
+            )
+
+    if total_target is not None and len(selected) < total_target:
+        needed = total_target - len(selected)
+        supplemental: List[Dict[str, Any]] = []
+        if args.meta_include_others:
+            others_group = grouped.get(None, [])
+            others_group.sort(key=lambda item: item['score'], reverse=True)
+            for entry in others_group:
+                entry['meta_label'] = list(entry['meta_label']) if isinstance(entry['meta_label'], tuple) else entry['meta_label']
+            supplemental.extend(others_group)
+
+        if leftovers:
+            leftovers.sort(key=lambda item: item['score'], reverse=True)
+            supplemental.extend(leftovers)
+
+        if supplemental:
+            additions = supplemental[:needed]
+            selected.extend(additions)
+            print(f'Added {len(additions)} samples from auxiliary groups to meet the target.')
+
+        if len(selected) < total_target:
+            print(
+                f'Warning: meta-label sampling gathered {len(selected)} samples '
+                f'but the target was {total_target}.'
+            )
+
+    if total_target is not None and len(selected) > total_target:
+        selected.sort(key=lambda item: item['score'], reverse=True)
+        selected = selected[:total_target]
+        print(f'Trimmed selection to the target of {total_target} samples.')
+
+    if not selected:
+        raise ValueError('Meta-label sampling did not select any samples.')
+
+    for entry in selected:
+        if isinstance(entry.get('meta_label'), tuple):
+            entry['meta_label'] = list(entry['meta_label'])
+
+    print(f'Total curated samples: {len(selected)}')
+    return selected
+
+
+
+def main():
+    args = arg_parse()
+    set_seed(args.seed)
+
+    if not os.path.isdir(args.dataset_path):
+        raise ValueError(f'Dataset path {args.dataset_path} does not exist or is not a directory.')
+
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+    teacher_model = load_teacher_model(args)
+
+    transforms_dict = build_transforms(args.image_size)
+    dataset = ImageFolderWithPaths(root=args.dataset_path, transform=None)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    curator = UnifiedInformativenessCurator(
+        teacher_model=teacher_model,
+        base_transform=transforms_dict['base'],
+        augmentation_transform=transforms_dict['augment'],
+        w_sens=args.w_sens,
+        w_pot=args.w_pot,
+        num_augmentations=args.num_augmentations,
+        device=device,
+        image_loader=dataset.loader,
+    )
+
+    subset_size = None if args.subset_size in (-1, None) else args.subset_size
+
+    if args.dataset is not None and args.dataset in CLASSIFICATION_DATASETS:
+        num_teacher_classes = CLASSIFICATION_DATASETS[args.dataset]
+    else:
+        num_teacher_classes = getattr(curator.teacher_model, 'num_classes', None)
+        if num_teacher_classes is None:
+            with torch.inference_mode():
+                dummy = torch.zeros(1, 3, args.image_size, args.image_size, device=device)
+                logits = curator.teacher_model(dummy)
+                num_teacher_classes = logits.shape[1]
+
+    if num_teacher_classes is None:
+        raise ValueError('Unable to determine the number of pseudo-label classes for distribution.')
+
+    if args.sampling_strategy == 'pseudo_label':
+        curated_samples = run_pseudo_label_sampling(
+            curator=curator,
+            dataset=dataset,
+            args=args,
+            subset_size=subset_size,
+            num_teacher_classes=num_teacher_classes,
+        )
+    elif args.sampling_strategy == 'feature_diversity':
+        curated_samples = run_feature_diversity_sampling(
+            curator=curator,
+            dataset=dataset,
+            args=args,
+            subset_size=subset_size,
+        )
+    elif args.sampling_strategy == 'meta_label':
+        curated_samples = run_meta_label_sampling(
+            curator=curator,
+            dataset=dataset,
+            args=args,
+            subset_size=subset_size,
+        )
+    else:
+        raise ValueError(f'Unknown sampling strategy: {args.sampling_strategy}')
 
     curator.save_curated_samples(
         curated_samples=curated_samples,
