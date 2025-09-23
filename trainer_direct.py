@@ -272,9 +272,9 @@ class Trainer(object):
 				student_ood_means.append(self.student_bn_layers[idx].running_mean.detach().clone())
 				student_ood_vars.append(self.student_bn_layers[idx].running_var.detach().clone())
 
-		for idx in range(len(self.student_bn_layers)):
-			delta_mean = teacher_ood_means[idx] - student_ood_means[idx]
-			delta_var = teacher_ood_vars[idx] - student_ood_vars[idx]
+                for idx in range(len(self.student_bn_layers)):
+                        delta_mean = student_ood_means[idx] - teacher_ood_means[idx]
+                        delta_var = student_ood_vars[idx] - teacher_ood_vars[idx]
 			self.bsdc_delta_means[idx] = delta_mean.detach()
 			self.bsdc_delta_vars[idx] = delta_var.detach()
 			self.bsdc_teacher_ood_stats[idx] = {
