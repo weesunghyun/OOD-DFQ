@@ -838,7 +838,9 @@ class UnifiedInformativenessCurator:
             )
 
         captured_batches: List[np.ndarray] = []
-        all_features: List[np.ndarray] = []
+        dataset_length = len(dataset)
+        features_array: Optional[np.ndarray] = None
+        write_index = 0
 
         def hook(module: nn.Module, inputs: Tuple[torch.Tensor, ...], output: torch.Tensor) -> None:
             if not inputs:
@@ -879,15 +881,27 @@ class UnifiedInformativenessCurator:
                             'Mismatch between captured features and batch size during feature extraction.'
                         )
 
-                    all_features.append(batch_features)
+                    if features_array is None:
+                        feature_shape = batch_features.shape[1:]
+                        features_array = np.empty(
+                            (dataset_length,) + feature_shape,
+                            dtype=np.float32,
+                        )
+
+                    end_index = write_index + batch_features.shape[0]
+                    if end_index > features_array.shape[0]:
+                        raise RuntimeError('Calculated feature slice exceeds preallocated array bounds.')
+
+                    features_array[write_index:end_index] = batch_features.astype(np.float32, copy=False)
+                    write_index = end_index
 
         finally:
             handle.remove()
 
-        if not all_features:
+        if features_array is None:
             return np.empty((0, 0), dtype=np.float32)
 
-        return np.concatenate(all_features, axis=0)
+        return features_array[:write_index]
 
     def select_top_samples(
         self,
