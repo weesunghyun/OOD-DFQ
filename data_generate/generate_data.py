@@ -876,13 +876,13 @@ class UnifiedInformativenessCurator:
             top_n=top_n,
         ))
 
-    def extract_features(
+    def iter_feature_batches(
         self,
         dataset: Dataset,
         batch_size: int,
         num_workers: int,
-    ) -> np.ndarray:
-        """Extracts penultimate features for the provided dataset."""
+    ) -> Iterator[np.ndarray]:
+        """Yields NumPy feature batches without materializing the full array."""
 
         linear_layer: Optional[nn.Module] = None
         for module in self.teacher_model.modules():
@@ -895,9 +895,6 @@ class UnifiedInformativenessCurator:
             )
 
         captured_batches: List[np.ndarray] = []
-        dataset_length = len(dataset)
-        features_array: Optional[np.ndarray] = None
-        write_index = 0
 
         def hook(module: nn.Module, inputs: Tuple[torch.Tensor, ...], output: torch.Tensor) -> None:
             if not inputs:
@@ -931,29 +928,47 @@ class UnifiedInformativenessCurator:
                     if not captured_batches:
                         raise RuntimeError('Feature hook did not capture outputs for the batch.')
 
-                    # Use the first captured batch (there should be only one per forward)
-                    batch_features = captured_batches[0]
+                    batch_features = np.asarray(captured_batches[0])
                     if batch_features.shape[0] != len(images):
                         raise RuntimeError(
                             'Mismatch between captured features and batch size during feature extraction.'
                         )
 
-                    if features_array is None:
-                        feature_shape = batch_features.shape[1:]
-                        features_array = np.empty(
-                            (dataset_length,) + feature_shape,
-                            dtype=np.float32,
-                        )
-
-                    end_index = write_index + batch_features.shape[0]
-                    if end_index > features_array.shape[0]:
-                        raise RuntimeError('Calculated feature slice exceeds preallocated array bounds.')
-
-                    features_array[write_index:end_index] = batch_features.astype(np.float32, copy=False)
-                    write_index = end_index
+                    yield batch_features.astype(np.float32, copy=False)
 
         finally:
             handle.remove()
+
+    def extract_features(
+        self,
+        dataset: Dataset,
+        batch_size: int,
+        num_workers: int,
+    ) -> np.ndarray:
+        """Extracts penultimate features for the provided dataset."""
+
+        dataset_length = len(dataset)
+        features_array: Optional[np.ndarray] = None
+        write_index = 0
+
+        for batch_features in self.iter_feature_batches(
+            dataset=dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+        ):
+            if features_array is None:
+                feature_shape = batch_features.shape[1:]
+                features_array = np.empty(
+                    (dataset_length,) + feature_shape,
+                    dtype=batch_features.dtype,
+                )
+
+            end_index = write_index + batch_features.shape[0]
+            if end_index > features_array.shape[0]:
+                raise RuntimeError('Calculated feature slice exceeds preallocated array bounds.')
+
+            features_array[write_index:end_index] = batch_features
+            write_index = end_index
 
         if features_array is None:
             return np.empty((0, 0), dtype=np.float32)
@@ -1336,14 +1351,14 @@ def run_feature_diversity_sampling(
         total_scored += 1
 
         if collect_all:
-            scored_samples.append(dict(sample))
+            scored_samples.append(sample)
             continue
 
         score = sample['score']
         if len(topk_heap) < candidate_pool_size:
-            heappush(topk_heap, (score, sample_index, dict(sample)))
+            heappush(topk_heap, (score, sample_index, sample))
         elif score > topk_heap[0][0]:
-            heappushpop(topk_heap, (score, sample_index, dict(sample)))
+            heappushpop(topk_heap, (score, sample_index, sample))
 
     if total_scored == 0:
         raise ValueError('No samples were scored when performing feature-diversity sampling.')
@@ -1370,14 +1385,6 @@ def run_feature_diversity_sampling(
         )
 
     candidate_dataset = CandidateDataset(candidate_pool, image_loader=dataset.loader)
-    features = curator.extract_features(
-        dataset=candidate_dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-    )
-
-    if features.shape[0] != len(candidate_pool):
-        raise RuntimeError('Feature extraction count mismatch with candidate pool.')
 
     num_clusters = min(args.feature_cluster_count, len(candidate_pool))
     if num_clusters <= 0:
@@ -1388,13 +1395,38 @@ def run_feature_diversity_sampling(
         batch_size=min(args.batch_size, len(candidate_pool)),
         random_state=args.seed,
     )
-    cluster_ids = mbatch.fit_predict(features)
+    has_features = False
+    for batch_features in curator.iter_feature_batches(
+        dataset=candidate_dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    ):
+        if batch_features.size == 0:
+            continue
+        mbatch.partial_fit(batch_features)
+        has_features = True
+
+    if not has_features:
+        raise RuntimeError('Feature extraction produced no batches for clustering.')
 
     clusters: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    for entry, cluster_id in zip(candidate_pool, cluster_ids):
-        sample = dict(entry)
-        sample['feature_cluster'] = int(cluster_id)
-        clusters[int(cluster_id)].append(sample)
+    assigned = 0
+    for batch_features in curator.iter_feature_batches(
+        dataset=candidate_dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    ):
+        if batch_features.size == 0:
+            continue
+        cluster_ids = mbatch.predict(batch_features)
+        for offset, cluster_id in enumerate(cluster_ids):
+            entry = candidate_pool[assigned + offset]
+            entry['feature_cluster'] = int(cluster_id)
+            clusters[int(cluster_id)].append(entry)
+        assigned += len(cluster_ids)
+
+    if assigned != len(candidate_pool):
+        raise RuntimeError('Feature batch iteration produced inconsistent sample counts.')
 
     total_target: Optional[int] = None
     if args.total_samples is not None and args.total_samples > 0:
@@ -1484,8 +1516,9 @@ def run_meta_label_sampling(
         raise ValueError('--meta_top_n must be positive when using meta-label sampling.')
 
     summary_accumulator = ScoreSummaryAccumulator()
-    scored_samples: List[Dict[str, Any]] = []
+    counter: Counter = Counter()
 
+    total_scored = 0
     for sample in curator.score_dataset_iter(
         dataset=dataset,
         subset_size=subset_size,
@@ -1497,9 +1530,10 @@ def run_meta_label_sampling(
         if 'meta_label' not in sample:
             raise RuntimeError('Meta-label information was not produced during scoring.')
         summary_accumulator.update(sample)
-        scored_samples.append(dict(sample))
+        counter[sample['meta_label']] += 1
+        total_scored += 1
 
-    if not scored_samples:
+    if total_scored == 0:
         raise ValueError('No samples were scored when performing meta-label sampling.')
 
     summary = summary_accumulator.to_dict()
@@ -1507,7 +1541,6 @@ def run_meta_label_sampling(
     for key, value in summary.items():
         print(f'  {key}: {value:.6f}')
 
-    counter: Counter = Counter(sample['meta_label'] for sample in scored_samples)
     most_common = counter.most_common(args.meta_label_top_k)
 
     if not most_common:
@@ -1521,14 +1554,21 @@ def run_meta_label_sampling(
         print(f'  {label}: {freq} samples')
 
     grouped: Dict[Optional[Tuple[int, ...]], List[Dict[str, Any]]] = defaultdict(list)
-    for sample in scored_samples:
+    include_others = bool(args.meta_include_others)
+
+    for sample in curator.score_dataset_iter(
+        dataset=dataset,
+        subset_size=subset_size,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        top_n=args.meta_top_n,
+    ):
         meta_label = sample['meta_label']
-        group_key: Optional[Tuple[int, ...]]
         if meta_label in valid_set:
-            group_key = meta_label
-        else:
-            group_key = None
-        grouped[group_key].append(sample)
+            grouped[meta_label].append(sample)
+        elif include_others:
+            grouped[None].append(sample)
 
     total_target: Optional[int] = None
     if args.total_samples is not None and args.total_samples > 0:
