@@ -98,10 +98,21 @@ def arg_parse():
                         type=int,
                         default=1024,
                         help='Batch size used during teacher inference.')
+    parser.add_argument('--feature_batch_size',
+                        type=int,
+                        default=None,
+                        help='Optional override for the batch size used during feature extraction. '
+                             'Defaults to --batch_size when omitted.')
     parser.add_argument('--num_workers',
                         type=int,
                         default=16,
                         help='Number of workers for the scoring dataloader.')
+    parser.add_argument('--prefetch_factor',
+                        type=int,
+                        default=None,
+                        help='Prefetch factor for DataLoader workers. Lower this value on machines with limited '
+                             'host memory to avoid OOM kills. Ignored when num_workers == 0 and defaults to '
+                             'PyTorch\'s internal setting when omitted.')
     parser.add_argument('--num_augmentations',
                         type=int,
                         default=5,
@@ -214,6 +225,12 @@ def arg_parse():
 
     if args.num_augmentations < 1:
         raise ValueError('--num_augmentations must be >= 1.')
+
+    if args.feature_batch_size is not None and args.feature_batch_size <= 0:
+        raise ValueError('--feature_batch_size must be positive when provided.')
+
+    if args.prefetch_factor is not None and args.prefetch_factor <= 0:
+        raise ValueError('--prefetch_factor must be positive when provided.')
 
     return args
 
@@ -524,6 +541,7 @@ class UnifiedInformativenessCurator:
         num_augmentations: int,
         device: torch.device,
         image_loader: Callable[[str], object] = default_loader,
+        prefetch_factor: Optional[int] = None,
     ):
         self.teacher_model = teacher_model.to(device).eval()
         self.base_transform = base_transform
@@ -534,6 +552,23 @@ class UnifiedInformativenessCurator:
         self.device = device
         self.loader = image_loader
         self.eps = 1e-8
+        self.prefetch_factor = prefetch_factor
+
+    def _build_loader_kwargs(self, batch_size: int, num_workers: int) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {
+            'batch_size': batch_size,
+            'shuffle': False,
+            'num_workers': num_workers,
+            'pin_memory': torch.cuda.is_available(),
+            'collate_fn': lambda batch: batch,
+        }
+
+        if num_workers > 0:
+            kwargs['persistent_workers'] = True
+            if self.prefetch_factor is not None:
+                kwargs['prefetch_factor'] = self.prefetch_factor
+
+        return kwargs
 
     def build_candidate_pool(
         self,
@@ -560,11 +595,7 @@ class UnifiedInformativenessCurator:
 
         loader = DataLoader(
             working_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-            collate_fn=lambda batch: batch,
+            **self._build_loader_kwargs(batch_size=batch_size, num_workers=num_workers)
         )
 
         total_batches = math.ceil(len(working_dataset) / batch_size)
@@ -790,11 +821,7 @@ class UnifiedInformativenessCurator:
 
         loader = DataLoader(
             working_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-            collate_fn=lambda batch: batch,
+            **self._build_loader_kwargs(batch_size=batch_size, num_workers=num_workers)
         )
 
         total_batches = math.ceil(len(working_dataset) / batch_size)
@@ -908,11 +935,7 @@ class UnifiedInformativenessCurator:
 
         loader = DataLoader(
             dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-            collate_fn=lambda batch: batch,
+            **self._build_loader_kwargs(batch_size=batch_size, num_workers=num_workers)
         )
 
         try:
@@ -1396,9 +1419,16 @@ def run_feature_diversity_sampling(
         random_state=args.seed,
     )
     has_features = False
+    feature_batch_size = args.feature_batch_size if args.feature_batch_size is not None else args.batch_size
+    if feature_batch_size != args.batch_size:
+        print(
+            f'Using feature extraction batch size {feature_batch_size} '
+            f'(scoring batch size {args.batch_size}).'
+        )
+
     for batch_features in curator.iter_feature_batches(
         dataset=candidate_dataset,
-        batch_size=args.batch_size,
+        batch_size=feature_batch_size,
         num_workers=args.num_workers,
     ):
         if batch_features.size == 0:
@@ -1413,7 +1443,7 @@ def run_feature_diversity_sampling(
     assigned = 0
     for batch_features in curator.iter_feature_batches(
         dataset=candidate_dataset,
-        batch_size=args.batch_size,
+        batch_size=feature_batch_size,
         num_workers=args.num_workers,
     ):
         if batch_features.size == 0:
@@ -1694,6 +1724,7 @@ def main():
         num_augmentations=args.num_augmentations,
         device=device,
         image_loader=dataset.loader,
+        prefetch_factor=args.prefetch_factor,
     )
 
     subset_size = None if args.subset_size in (-1, None) else args.subset_size
